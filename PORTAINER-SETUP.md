@@ -47,7 +47,7 @@ Under **Environment variables** in the Portainer stack, enter:
 | `HOST_PORT` | `3005` |
 | `COOKIE_SECURE` | `0` for local HTTP |
 
-Optional: `EODHD_API_KEY` for automatic US/ASX prices, `REFRESH_SECONDS` (default `3600`), `BACKUP_RETENTION_DAYS` (default `30`). The account passwords are used to create users only when the database is first initialized; changing these Portainer variables later will **not** reset existing accounts. Users can change their password from inside the app.
+Optional: `ALPHA_VANTAGE_API_KEY` for daily closing prices (enter the key in Portainer, never in GitHub); `EODHD_API_KEY` only when using that provider instead; `REFRESH_SECONDS` (blank defaults to 900 seconds with Alpha Vantage, otherwise 3600); `BACKUP_RETENTION_DAYS` (default `30`). The free Alpha Vantage plan allows 25 API requests daily, including ticker lookups. The account passwords are used to create users only when the database is first initialized; changing these Portainer variables later will **not** reset existing accounts. Users can change their password from inside the app.
 
 Select **Deploy the stack**. The `investment-dashboard`, `portfolio-price-worker`, and `portfolio-backup` containers should be running; the main container should show healthy. You don't need the Portainer 'relative path volumes' switch because this stack uses **absolute host paths**.
 
@@ -57,7 +57,7 @@ If the web container reports **unhealthy**, the other services can still start s
 
 From a device on your home network, open `http://YOUR-UBUNTU-SERVER-IP:3005` and sign in with your admin username and password. Your brother uses his separate login at the same address. Your admin account can switch portfolios at the top; his account is locked to his own portfolio on the server.
 
-In **Manage**, create each account, add holdings and enter your earliest deposits and all trades, dividends, fees, interest, transfers and FX conversions. Then set prices manually or add an EODHD key. You can upload tax statements in Manage and find them in Documents or on the linked holding page.
+In **Manage**, create each account, add holdings and enter your earliest deposits and all trades, dividends, fees, interest, transfers and FX conversions. Then set prices manually or add your Alpha Vantage key in the stack environment and redeploy. The worker checks published closes after 5 pm in the relevant market’s time zone. The holding detail page displays your stored close plus a separate TradingView chart; symbols can be edited in Manage → Holdings. You can upload tax statements in Manage and find them in Documents or on the linked holding page.
 
 ## 5. Updates and backups
 

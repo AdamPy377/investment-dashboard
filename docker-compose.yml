@@ -15,6 +15,7 @@ services:
       VIEWER_USERNAME: ${VIEWER_USERNAME:-brother}
       VIEWER_PASSWORD: ${VIEWER_PASSWORD:?Set VIEWER_PASSWORD in Portainer}
       EODHD_API_KEY: ${EODHD_API_KEY:-}
+      ALPHA_VANTAGE_API_KEY: ${ALPHA_VANTAGE_API_KEY:-}
       COOKIE_SECURE: ${COOKIE_SECURE:-0}
       TZ: Australia/Melbourne
     ports:
@@ -43,7 +44,8 @@ services:
       VIEWER_USERNAME: ${VIEWER_USERNAME:-brother}
       VIEWER_PASSWORD: ${VIEWER_PASSWORD:?Set VIEWER_PASSWORD in Portainer}
       EODHD_API_KEY: ${EODHD_API_KEY:-}
-      REFRESH_SECONDS: ${REFRESH_SECONDS:-3600}
+      ALPHA_VANTAGE_API_KEY: ${ALPHA_VANTAGE_API_KEY:-}
+      REFRESH_SECONDS: ${REFRESH_SECONDS:-}
       TZ: Australia/Melbourne
     command: ["python", "worker.py"]
     depends_on:
