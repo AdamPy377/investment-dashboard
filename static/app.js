@@ -85,9 +85,15 @@ function renderOverview(){
   $('profit').textContent=money(d.profit);$('profit').className=signClass(d.profit);
   $('dayChange').textContent=money(d.day_change);$('dayChange').className=signClass(d.day_change);
   $('holdings').innerHTML=d.holdings.length?d.holdings.map(h=>`<div class="row clickable" data-holding="${h.id}" tabindex="0" role="button"><div class="row-main"><b>${esc(h.symbol)} <span class="pill">${esc(h.exchange)}</span></b><small>${esc(h.name)} · ${number(h.quantity)} shares · ${esc(h.brokers.map(b=>b.name).join(', '))}</small></div><div class="row-side"><b class="${signClass(h.value)}">${money(h.value,h.currency)}</b><small>${money(h.price,h.currency)} / share · <span class="${signClass(h.gain_pct)}">${pct(h.gain_pct)}</span></small></div></div>`).join(''):empty('No holdings yet. Add an account, a holding and a buy transaction in Manage.');
-  const valued=d.holdings.filter(h=>h.value!=null).map(h=>({...h,aud:h.value*(h.currency==='USD'?(d.fx_rate||0):1)}));
+  const valued=d.holdings.filter(h=>h.value>0&&(h.currency!=='USD'||d.fx_rate>0)).map(h=>({...h,aud:h.value*(h.currency==='USD'?d.fx_rate:1)}));
   const total=valued.reduce((s,h)=>s+h.aud,0);
-  $('allocation').innerHTML=valued.length&&total>0?valued.map(h=>`<div class="row"><div class="row-main"><b>${esc(h.symbol)}</b><small>${(h.aud/total*100).toFixed(1)}% of invested holdings</small><div class="bar"><span style="width:${Math.max(1,h.aud/total*100)}%"></span></div></div><div class="row-side ${signClass(h.aud)}">${money(h.aud)}</div></div>`).join(''):empty('Add prices to see allocation.');
+  const colors=['#7eddd1','#ab9aee','#f7bf72','#78afe9','#f4829c','#afd873','#e6a6dc','#76c9a8','#d9a783','#86a5e8'];
+  if(total>0){
+    let position=0;
+    const slices=valued.map((h,i)=>{const from=position;position+=h.aud/total*100;return `${colors[i%colors.length]} ${from.toFixed(4)}% ${position.toFixed(4)}%`});
+    const labels=valued.map((h,i)=>`${h.symbol}: ${(h.aud/total*100).toFixed(1)}%`).join(', ');
+    $('allocation').innerHTML=`<div class="allocation-layout"><div class="allocation-pie" role="img" aria-label="${esc(labels)}" style="background:conic-gradient(${slices.join(',')})"></div><div class="allocation-key">${valued.map((h,i)=>`<div class="allocation-item"><span class="allocation-dot" style="background:${colors[i%colors.length]}"></span><span>${esc(h.symbol)}</span><b>${(h.aud/total*100).toFixed(1)}%</b></div>`).join('')}</div></div>${valued.length<d.holdings.length?'<p class="muted fine">Holdings without a saved price or USD/AUD rate are excluded.</p>':''}`;
+  }else $('allocation').innerHTML=empty('Add holding prices to see allocation.');
   $('cashSummary').innerHTML=d.cash.length?d.cash.map(a=>`<div class="row"><div class="row-main"><b>${esc(a.name)}</b><small>Cash available · ${esc(a.currency)}</small></div><div class="row-side"><b class="${signClass(a.balance)}">${money(a.balance,a.currency)}</b></div></div>`).join(''):empty('No cash accounts yet.');
   drawChart();
 }
@@ -156,26 +162,31 @@ function renderDetail(){
   const priceRows=h.prices.slice(-60).reverse();
   $('detailContent').innerHTML=`<div class="card"><div class="detail-head"><div><span class="pill">${esc(h.exchange)} · ${esc(h.currency)}</span><h2>${esc(h.symbol)}</h2><span class="muted">${esc(h.name)}</span></div><div class="row-side"><strong class="${signClass(h.price)}">${money(h.price,h.currency)}</strong><small>As of ${esc(h.price_day||'no price')} · ${esc(h.price_source||'')}</small></div></div><div class="detail-grid"><div class="metric"><small>Current value</small><strong class="${signClass(h.value)}">${money(h.value,h.currency)}</strong></div><div class="metric"><small>Shares</small><strong>${number(h.quantity)}</strong></div><div class="metric"><small>Average cost</small><strong>${money(h.avg_cost,h.currency)}</strong></div><div class="metric"><small>Unrealised gain</small><strong class="${signClass(h.gain)}">${money(h.gain,h.currency)} · ${pct(h.gain_pct)}</strong></div></div><p class="muted fine">Average cost uses a pooled cost basis. Realised gain on sales: <span class="${signClass(h.realized)}">${money(h.realized,h.currency)}</span>. Tax reporting may use different rules.</p></div>
   <div class="card"><h2>Held through broker</h2>${h.brokers.map(b=>`<div class="row"><b>${esc(b.name)}</b><span>${number(b.quantity)} shares</span></div>`).join('')}</div>
-  <div class="card"><h2>Market chart</h2><p class="muted fine">TradingView provides this chart independently. Your portfolio value uses the saved ${esc(h.price_source||"manual")} price dated ${esc(h.price_day||"not available")}.</p><div id="tvChart" class="tv-chart"></div></div>
+  <div class="card"><h2>Market overview</h2><p class="muted fine">TradingView provides this chart separately. Your portfolio value uses the saved ${esc(h.price_source||"price")} dated ${esc(h.price_day||"not available")}.</p><div id="tradingViewOverview" class="tv-overview"></div></div>
   <div class="card chart-card"><h2>Price history</h2><canvas id="detailChart" height="200" aria-label="Holding price history chart"></canvas><p class="muted fine">Daily closing prices in ${esc(h.currency)}. Missing dates have no price.</p></div>
   <div class="two-col"><div class="card"><h2>Transactions</h2>${tx.length?tx.map(t=>`<div class="row"><div class="row-main"><b>${esc(t.type)} · ${esc(t.occurred_at)}</b><small>${esc(t.account_name)} · ${number(t.quantity)} shares</small></div><div class="row-side ${signClass(cashMovement(t))}">${money(cashMovement(t),t.currency)}</div></div>`).join(''):empty('No transactions.')}</div>
   <div class="card"><h2>Documents</h2>${docs.length?docs.map(d=>`<div class="row"><div class="row-main"><b>${esc(d.title)}</b><small>${esc(d.tax_year||d.original_name)}</small></div><a href="/api/documents/${d.id}/file" target="_blank" rel="noopener">Open</a></div>`).join(''):empty('No documents attached to this holding.')}</div></div>
   <div class="card"><h2>Recent price history</h2>${priceRows.length?priceRows.map(p=>`<div class="row"><span>${esc(p.day)} <small class="muted">${esc(p.source)}</small></span><b class="${signClass(p.close)}">${money(p.close,h.currency)}</b></div>`).join(''):empty('Add prices manually or connect a delayed price feed.')}</div>`;
-  mountTradingView(h);
+  renderTradingViewOverview(h);
   requestAnimationFrame(()=>drawDetailChart(h));
 }
-function mountTradingView(h){
+function renderTradingViewOverview(h){
   const symbol=h.tv_symbol||(h.exchange==='AU'?`ASX:${h.symbol}`:`NASDAQ:${h.symbol}`);
-  const target=$('tvChart');
+  const target=$('tradingViewOverview');
   if(!/^[A-Z0-9.-]+:[A-Z0-9.-]+$/.test(symbol))return;
   const container=document.createElement('div');container.className='tradingview-widget-container';
   const widget=document.createElement('div');widget.className='tradingview-widget-container__widget';container.append(widget);
-  const link=document.createElement('a');link.href=`https://www.tradingview.com/symbols/${encodeURIComponent(symbol.replace(':','-'))}/`;
-  link.target='_blank';link.rel='noopener noreferrer';link.textContent=`Open ${symbol} on TradingView`;container.append(link);
   target.append(container);
+  const link=document.createElement('a');
+  link.className='tv-fallback';
+  link.href=`https://www.tradingview.com/symbols/${symbol.replace(':','-')}/`;
+  link.target='_blank';link.rel='noopener noreferrer';
+  link.textContent=`View ${symbol} on TradingView ↗`;
+  container.append(link);
   const script=document.createElement('script');script.async=true;
-  script.src='https://s3.tradingview.com/external-embedding/embed-widget-advanced-chart.js';
-  script.textContent=JSON.stringify({autosize:true,symbol,interval:'D',timezone:'exchange',theme:'dark',style:'1',locale:'en',allow_symbol_change:false,hide_side_toolbar:false,save_image:false,calendar:false,support_host:'https://www.tradingview.com'});
+  script.src='https://s3.tradingview.com/external-embedding/embed-widget-symbol-overview.js';
+  script.textContent=JSON.stringify({symbols:[[h.name,`${symbol}|1D`]],chartType:'area',lineWidth:2,colorTheme:'dark',backgroundColor:'#151e31',widgetFontColor:'#f3f6fc',fontColor:'#99aabf',gridLineColor:'#30405b',lineType:0,locale:'en',dateRanges:['1d|1','1m|30','3m|60','12m|1D','all|1M'],autosize:true,width:'100%',height:'100%'});
+  script.onerror=()=>{widget.textContent='Chart unavailable here. Use the TradingView link below.'};
   container.append(script);
 }
 function drawDetailChart(h){
