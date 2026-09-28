@@ -378,7 +378,8 @@ def delete_instrument(iid):
     return jsonify(ok=True)
 
 
-TYPES = {'buy', 'sell', 'deposit', 'withdrawal', 'dividend', 'interest', 'fee', 'transfer', 'fx', 'split'}
+TYPES = {'buy', 'sell', 'deposit', 'withdrawal', 'dividend', 'interest', 'fee', 'transfer', 'fx', 'split',
+         'adjustment_in', 'adjustment_out'}
 
 
 def validate_transaction(c, d, pid):
@@ -390,19 +391,19 @@ def validate_transaction(c, d, pid):
         raise ValueError('Choose an account in this portfolio')
     target = get_owned(c, 'accounts', d.get('target_account_id'), pid) if d.get('target_account_id') else None
     instrument = c.execute('SELECT * FROM instruments WHERE id=?', (d.get('instrument_id'),)).fetchone() if d.get('instrument_id') else None
-    quantity = num(d.get('quantity', 0), 'Quantity')
-    price = num(d.get('price', 0), 'Price')
-    amount = num(d.get('amount', 0), 'Amount')
-    target_amount = num(d.get('target_amount', 0), 'Received amount')
-    fee = num(d.get('fee', 0), 'Fee')
-    tax = num(d.get('tax', 0), 'Tax withheld')
-    fx_rate = num(d.get('fx_rate', 0), 'FX rate')
+    quantity = num(d.get('quantity') or 0, 'Quantity')
+    price = num(d.get('price') or 0, 'Price')
+    amount = num(d.get('amount') or 0, 'Amount')
+    target_amount = num(d.get('target_amount') or 0, 'Received amount')
+    fee = num(d.get('fee') or 0, 'Fee')
+    tax = num(d.get('tax') or 0, 'Tax withheld')
+    fx_rate = num(d.get('fx_rate') or 0, 'FX rate')
     day = iso_day(d.get('occurred_at'))
     if kind in ('buy', 'sell') and (not instrument or instrument['currency'] != account['currency'] or quantity <= 0 or price <= 0):
         raise ValueError('Buy and sell need a holding, matching currency, quantity and price')
     if kind == 'split' and (not instrument or instrument['currency'] != account['currency'] or quantity <= 0):
         raise ValueError('Split needs a holding and the additional number of shares')
-    if kind in ('deposit', 'withdrawal', 'dividend', 'interest', 'fee') and amount <= 0:
+    if kind in ('deposit', 'withdrawal', 'dividend', 'interest', 'fee', 'adjustment_in', 'adjustment_out') and amount <= 0:
         raise ValueError('Enter an amount greater than zero')
     if kind == 'dividend' and not instrument:
         raise ValueError('Choose a holding for the dividend')
@@ -741,6 +742,10 @@ def calculate(c, pid):
                 current_cash[aid] += amount - tax
             elif kind == 'fee':
                 current_cash[aid] -= amount
+            elif kind == 'adjustment_in':
+                current_cash[aid] += amount
+            elif kind == 'adjustment_out':
+                current_cash[aid] -= amount
             elif kind in ('transfer', 'fx'):
                 current_cash[aid] -= amount + fee
                 current_cash[t['target_account_id']] += t['target_amount']
@@ -955,6 +960,39 @@ def edit_reconciliation(rid):
         return jsonify(ok=True)
     except ValueError as e:
         return problem(str(e))
+
+
+@app.post('/api/reconciliations/<int:rid>/match')
+@auth(admin=True)
+def match_reconciliation(rid):
+    pid = portfolio_id()
+    d = request.get_json() or {}
+    try:
+        expected = float(d['expected_account_value'])
+        if not Decimal(str(expected)).is_finite():
+            raise ValueError()
+    except (KeyError, ValueError, TypeError, OverflowError):
+        return problem('Reload the balance check and try again')
+    with db() as c:
+        check = get_owned(c, 'reconciliations', rid, pid)
+        if not check:
+            abort(404)
+        if check['day'] != local_today().isoformat():
+            return problem('Only a balance check dated today can update cash')
+        account = next((a for a in calculate(c, pid)['cash'] if a['id'] == check['account_id']), None)
+        if not account or account['account_value'] is None:
+            return problem('Add a price for every holding in this account before matching its value')
+        if abs(account['account_value'] - expected) > .005:
+            return problem('Account value has changed. Reload and review the difference before matching', 409)
+        difference = round(check['reported_value'] - account['account_value'], 2)
+        if abs(difference) < .005:
+            return jsonify(ok=True, amount=0)
+        kind = 'adjustment_in' if difference > 0 else 'adjustment_out'
+        note = f'Balance check #{rid}: broker account value {check["reported_value"]:.2f}; cash adjustment'
+        cur = c.execute('''INSERT INTO transactions(portfolio_id,account_id,type,occurred_at,amount,note)
+            VALUES(?,?,?,?,?,?)''', (pid, check['account_id'], kind, check['day'], abs(difference), note))
+        audit(c, pid, cur.lastrowid, 'create', after=c.execute('SELECT * FROM transactions WHERE id=?', (cur.lastrowid,)).fetchone())
+    return jsonify(ok=True, amount=difference)
 
 
 @app.delete('/api/reconciliations/<int:rid>')
