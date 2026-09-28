@@ -47,7 +47,7 @@ Under **Environment variables** in the Portainer stack, enter:
 | `HOST_PORT` | `3005` |
 | `COOKIE_SECURE` | `0` for local HTTP |
 
-Optional: `REFRESH_SECONDS` (blank defaults to 900 seconds between worker checks); `BACKUP_RETENTION_DAYS` (default `30`). Yahoo Finance requires no API key. You can remove old `ALPHA_VANTAGE_API_KEY` and `EODHD_API_KEY` stack variables: this release does not use them. The account passwords are used to create users only when the database is first initialized; changing these Portainer variables later will **not** reset existing accounts. Users can change their password from inside the app.
+Optional: `REFRESH_SECONDS` (blank defaults to 900 seconds between worker checks); `BACKUP_RETENTION_DAYS` (default `30`). Yahoo Finance requires no API key. You can remove old `ALPHA_VANTAGE_API_KEY` and `EODHD_API_KEY` stack variables: this release does not use them. The account passwords are used to create users only when the database is first initialized; changing these Portainer variables later will **not** reset existing accounts. Users can change their password in **Settings**. The admin can reset the viewer password there. A missing or short first-install password now prevents the web container from starting and produces a clear log error; check the stack variables if that happens.
 
 Select **Deploy the stack**. The `investment-dashboard`, `portfolio-price-worker`, and `portfolio-backup` containers should be running; the main container should show healthy. You don't need the Portainer 'relative path volumes' switch because this stack uses **absolute host paths**.
 
@@ -57,7 +57,7 @@ If the web container reports **unhealthy**, the other services can still start s
 
 From a device on your home network, open `http://YOUR-UBUNTU-SERVER-IP:3005` and sign in with your admin username and password. Your brother uses his separate login at the same address. Your admin account can switch portfolios at the top; his account is locked to his own portfolio on the server.
 
-In **Manage**, create each account, add holdings and enter your earliest deposits and all trades, dividends, fees, interest, transfers and FX conversions. The worker fetches Yahoo Finance daily closes and backfills from each holding’s earliest buy, including sold holdings. Prices can still be corrected manually. Published closes are checked from 5 pm in the relevant market’s time zone. The holding detail page displays your stored close and TradingView's Symbol Overview chart, with a link if the widget cannot load; symbols can be edited in Manage → Holdings. You can upload tax statements in Manage and find them in Documents or on the linked holding page.
+In **Manage**, create each account, add holdings and enter your earliest deposits and all trades, dividends, fees, interest, transfers and FX conversions. The worker fetches Yahoo Finance daily closes and backfills from each holding’s earliest buy, including sold holdings. Prices can still be corrected manually. Published closes are checked from 5 pm in the relevant market’s time zone. The holding detail page displays your stored close and TradingView's Symbol Overview chart in an isolated iframe, with a link if the widget cannot load; symbols can be edited in Manage → Holdings. You can upload tax statements in Manage and find them in Documents or on the linked holding page.
 
 ## 5. Updates and backups
 

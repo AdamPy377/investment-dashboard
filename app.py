@@ -98,6 +98,8 @@ def init_db():
             c.execute("ALTER TABLE reconciliations ADD COLUMN balance_scope TEXT NOT NULL DEFAULT 'cash'")
         if 'adjustment_transaction_id' not in recon_columns:
             c.execute('ALTER TABLE reconciliations ADD COLUMN adjustment_transaction_id INTEGER REFERENCES transactions(id) ON DELETE SET NULL')
+        if 'session_version' not in {column['name'] for column in c.execute('PRAGMA table_info(users)')}:
+            c.execute('ALTER TABLE users ADD COLUMN session_version INTEGER NOT NULL DEFAULT 0')
         # Older versions treated broker cash accounts as cash plus holdings.
         # The account is cash only; retain the reported figure and linked adjustment
         # so the owner can review and rematch an existing check to cash.
@@ -109,9 +111,12 @@ def init_db():
             (os.getenv('ADMIN_USERNAME', 'adam'), os.getenv('ADMIN_PASSWORD'), 'admin', 1),
             (os.getenv('VIEWER_USERNAME', 'brother'), os.getenv('VIEWER_PASSWORD'), 'viewer', 2),
         ]:
-            if password and len(password) >= 12:
-                c.execute('INSERT OR IGNORE INTO users(username,password_hash,role,portfolio_id) VALUES(?,?,?,?)',
-                          (username, generate_password_hash(password), role, pid))
+            if c.execute('SELECT 1 FROM users WHERE username=?', (username,)).fetchone():
+                continue
+            if not password or len(password) < 12:
+                raise RuntimeError(f'{role.upper()}_PASSWORD must be at least 12 characters to create the account')
+            c.execute('INSERT INTO users(username,password_hash,role,portfolio_id) VALUES(?,?,?,?)',
+                      (username, generate_password_hash(password), role, pid))
 
 
 init_db()
@@ -135,6 +140,11 @@ def auth(admin=False):
         def inner(*args, **kwargs):
             if not session.get('user_id'):
                 return problem('Please log in', 401)
+            with db() as c:
+                user = c.execute('SELECT session_version FROM users WHERE id=?', (session['user_id'],)).fetchone()
+            if not user or session.get('session_version', 0) != user['session_version']:
+                session.clear()
+                return problem('Session expired. Please log in again.', 401)
             if admin and session.get('role') != 'admin':
                 return problem('Admin access required', 403)
             if request.method not in ('GET', 'HEAD') and request.headers.get('X-CSRF-Token') != session.get('csrf'):
@@ -210,7 +220,14 @@ def static(path):
 @app.get('/api/auth')
 def auth_state():
     if not session.get('user_id'):
-        return jsonify(authenticated=False, configured=bool(os.getenv('ADMIN_PASSWORD') and os.getenv('VIEWER_PASSWORD')))
+        with db() as c:
+            configured = c.execute('SELECT COUNT(*) FROM users').fetchone()[0] == 2
+        return jsonify(authenticated=False, configured=configured)
+    with db() as c:
+        user = c.execute('SELECT session_version FROM users WHERE id=?', (session['user_id'],)).fetchone()
+    if not user or session.get('session_version', 0) != user['session_version']:
+        session.clear()
+        return jsonify(authenticated=False, configured=True)
     return jsonify(authenticated=True, username=session['username'], role=session['role'],
                    portfolio_id=session['portfolio_id'], csrf=session['csrf'])
 
@@ -232,7 +249,8 @@ def login():
     LOGIN_ATTEMPTS.pop(ip, None)
     session.clear()
     session.update(user_id=user['id'], username=user['username'], role=user['role'],
-                   portfolio_id=user['portfolio_id'], csrf=secrets.token_urlsafe(32))
+                   portfolio_id=user['portfolio_id'], session_version=user['session_version'],
+                   csrf=secrets.token_urlsafe(32))
     return auth_state()
 
 
@@ -255,7 +273,28 @@ def change_password():
         user = c.execute('SELECT * FROM users WHERE id=?', (session['user_id'],)).fetchone()
         if not user or not check_password_hash(user['password_hash'], current):
             return problem('Current password is incorrect', 403)
-        c.execute('UPDATE users SET password_hash=? WHERE id=?', (generate_password_hash(replacement), user['id']))
+        c.execute('UPDATE users SET password_hash=?,session_version=session_version+1 WHERE id=?',
+                  (generate_password_hash(replacement), user['id']))
+        session['session_version'] = user['session_version'] + 1
+    return jsonify(ok=True)
+
+
+@app.post('/api/admin/reset-viewer-password')
+@auth(admin=True)
+def reset_viewer_password():
+    d = request.get_json() or {}
+    password = str(d.get('new_password', ''))
+    if not 12 <= len(password) <= 256:
+        return problem('New password must contain 12–256 characters')
+    with db() as c:
+        admin = c.execute('SELECT password_hash FROM users WHERE id=?', (session['user_id'],)).fetchone()
+        if not admin or not check_password_hash(admin['password_hash'], str(d.get('admin_password', ''))):
+            return problem('Your admin password is incorrect', 403)
+        viewer = c.execute("SELECT id FROM users WHERE role='viewer' AND portfolio_id=2").fetchone()
+        if not viewer:
+            return problem('Viewer account not found', 404)
+        c.execute('UPDATE users SET password_hash=?,session_version=session_version+1 WHERE id=?',
+                  (generate_password_hash(password), viewer['id']))
     return jsonify(ok=True)
 
 
@@ -894,13 +933,42 @@ def calculate(c, pid):
     holdings.sort(key=lambda h: (h['value'] or 0) * (rate if h['currency'] == 'USD' and rate else 1), reverse=True)
     cash = [{**a, 'balance': current_cash[a['id']]} for a in accounts]
     current = series[-1]
-    prev = series[-2] if len(series) > 1 else None
-    day_change = (current['value'] - prev['value'] - (current['invested'] - prev['invested'])
-                  if prev and None not in (current['value'], prev['value'], current['invested'], prev['invested']) else None)
+    # Current positions at their last two published closes. Trades and cash transfers
+    # are excluded; USD exposure includes the move between the last two FX fixes.
+    session_move = 0.0
+    prior_usd_exposure = sum(current_cash[a['id']] for a in accounts if a['currency'] == 'USD')
+    missing_session_data = False
+    stale_holdings = []
+    for holding in holdings:
+        history = [p for p in price_history.get(holding['id'], []) if p['day'] <= today.isoformat()]
+        expected = closed_market_day(holding['exchange'])
+        if not history or history[-1]['day'] < expected:
+            stale_holdings.append({'symbol': holding['symbol'], 'price_day': holding['price_day'],
+                                   'expected_day': expected})
+        if len(history) < 2:
+            missing_session_data = True
+            continue
+        prior, latest = history[-2]['close'], history[-1]['close']
+        if holding['currency'] == 'USD':
+            prior_usd_exposure += holding['quantity'] * prior
+            if rate is None:
+                missing_session_data = True
+            else:
+                session_move += holding['quantity'] * (latest - prior) * rate
+        else:
+            session_move += holding['quantity'] * (latest - prior)
+    usd_accounts = any(a['currency'] == 'USD' for a in accounts)
+    previous_rate = fx[fx_i - 2]['usd_aud'] if fx_i > 1 else None
+    if (usd_accounts or any(h['currency'] == 'USD' for h in holdings)) and rate is not None:
+        if previous_rate is None:
+            missing_session_data = True
+        else:
+            session_move += prior_usd_exposure * (rate - previous_rate)
+    session_move = None if missing_session_data or current['value'] is None else session_move
     return {'holdings': holdings, 'cash': cash, 'series': series,
             'value': current['value'], 'invested': current['invested'],
             'profit': current['value'] - current['invested'] if current['value'] is not None and current['invested'] is not None else None,
-            'day_change': day_change, 'fx_rate': rate,
+            'session_move': session_move, 'stale_holdings': stale_holdings, 'fx_rate': rate,
             'fx_day': fx[fx_i - 1]['day'] if fx_i else None,
             'unpriced': current['unpriced']}
 
@@ -1009,7 +1077,7 @@ def delete_document(did):
 
 
 @app.get('/api/reconciliations')
-@auth()
+@auth(admin=True)
 def reconciliations():
     pid = portfolio_id()
     with db() as c:

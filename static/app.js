@@ -34,11 +34,11 @@ function field(form,name){return form.elements.namedItem(name)}
 function formData(form){return Object.fromEntries(new FormData(form).entries())}
 function options(select, items, label, blank=''){const current=select.value;select.innerHTML=(blank!==null?`<option value="">${esc(blank)}</option>`:'')+items.map(x=>`<option value="${x.id}">${esc(label(x))}</option>`).join('');if([...select.options].some(o=>o.value===current))select.value=current}
 function show(page){
-  if(page==='admin'&&state.auth.role!=='admin')return;
+  if(['admin','reconcile'].includes(page)&&state.auth.role!=='admin')return;
   state.page=page;
   document.querySelectorAll('.page').forEach(el=>el.hidden=el.id!==page);
   document.querySelectorAll('nav button').forEach(el=>el.classList.toggle('active',el.dataset.page===page));
-  $('pageTitle').textContent=({overview:'Overview',transactions:'Transactions',cash:'Cash & accounts',documents:'Documents',reconcile:'Reconcile',admin:'Manage',holdingDetail:'Holding details'})[page];
+  $('pageTitle').textContent=({overview:'Overview',transactions:'Transactions',cash:'Cash balances',documents:'Documents',reconcile:'Reconcile',admin:'Manage',holdingDetail:'Holding details',settings:'Settings'})[page];
   if(page==='overview'&&state.dashboard)requestAnimationFrame(drawChart);
   window.scrollTo({top:0,behavior:'smooth'});
 }
@@ -49,12 +49,16 @@ function showManage(panel='trades'){
 }
 async function load(){
   const [setup,dashboard,tx,docs,recon,prices,fx]=await Promise.all([
-    api(query('/setup')),api(query('/dashboard')),api(query('/transactions')),api(query('/documents')),api(query('/reconciliations')),
+    api(query('/setup')),api(query('/dashboard')),api(query('/transactions')),api(query('/documents')),state.auth.role==='admin'?api(query('/reconciliations')):Promise.resolve([]),
     state.auth.role==='admin'?api('/prices'):Promise.resolve([]),state.auth.role==='admin'?api('/fx-rates'):Promise.resolve([])]);
   Object.assign(state,{setup,dashboard,tx,docs,recon,prices,fx});
   $('portfolioName').textContent=setup.portfolios.find(p=>p.id===state.pid)?.name+'’s portfolio';
-  const latest=dashboard.holdings.map(h=>h.price_day).filter(Boolean).sort().at(-1);
-  $('dataStamp').textContent=latest?`Latest holding price: ${latest}`:'No holding prices yet';
+  const missing=dashboard.holdings.filter(h=>!h.price_day).map(h=>h.symbol);
+  const dated=dashboard.holdings.map(h=>h.price_day).filter(Boolean).sort();
+  const stale=dashboard.stale_holdings.filter(h=>h.price_day).map(h=>h.symbol);
+  const stamp=missing.length?`Missing prices: ${missing.join(', ')}`:dated.length?`Oldest holding price: ${dated[0]}`:'No holding prices yet';
+  $('dataStamp').textContent=stamp+(stale.length?` · Check ${stale.join(', ')}`:'');
+  $('dataStamp').classList.toggle('down',Boolean(missing.length||stale.length));
   renderOptions();updateTypeFields();renderOverview();renderTransactions();renderCash();renderDocs();renderRecon();renderManage();
   if(state.page==='holdingDetail')renderDetail();
 }
@@ -83,8 +87,8 @@ function renderOverview(){
   $('totalValue').className=`big-number ${signClass(d.value)}`;
   $('totalContext').textContent=d.value==null?'Add prices and a USD/AUD rate to complete the valuation':`AUD · investments and cash${d.fx_rate?` · USD/AUD ${number(d.fx_rate)} (${d.fx_day})`:''}`;
   $('profit').textContent=money(d.profit);$('profit').className=signClass(d.profit);
-  $('dayChange').textContent=money(d.day_change);$('dayChange').className=signClass(d.day_change);
-  $('holdings').innerHTML=d.holdings.length?d.holdings.map(h=>`<div class="row clickable" data-holding="${h.id}" tabindex="0" role="button"><div class="row-main"><b>${esc(h.symbol)} <span class="pill">${esc(h.exchange)}</span></b><small>${esc(h.name)} · ${number(h.quantity)} shares · ${esc(h.brokers.map(b=>b.name).join(', '))}</small></div><div class="row-side"><b class="${signClass(h.value)}">${money(h.value,h.currency)}</b><small>${money(h.price,h.currency)} / share · <span class="${signClass(h.gain_pct)}">${pct(h.gain_pct)}</span></small></div></div>`).join(''):empty('No holdings yet. Add an account, a holding and a buy transaction in Manage.');
+  $('dayChange').textContent=money(d.session_move);$('dayChange').className=signClass(d.session_move);
+  $('holdings').innerHTML=d.holdings.length?d.holdings.map(h=>`<div class="row clickable" data-holding="${h.id}" tabindex="0" role="button"><div class="row-main"><b>${esc(h.symbol)} <span class="pill">${esc(h.exchange)}</span></b><small>${esc(h.name)} · ${number(h.quantity)} shares · ${esc(h.brokers.map(b=>b.name).join(', '))}</small></div><div class="row-side"><b class="${signClass(h.value)}">${money(h.value,h.currency)}</b><small>${money(h.price,h.currency)} / share · ${esc(h.price_day||'no price date')} · <span class="${signClass(h.gain_pct)}">${pct(h.gain_pct)}</span></small></div></div>`).join(''):empty('No holdings yet. Add an account, a holding and a buy transaction in Manage.');
   const valued=d.holdings.filter(h=>h.value>0&&(h.currency!=='USD'||d.fx_rate>0)).map(h=>({...h,aud:h.value*(h.currency==='USD'?d.fx_rate:1)}));
   const total=valued.reduce((s,h)=>s+h.aud,0);
   const colors=['#7eddd1','#ab9aee','#f7bf72','#78afe9','#f4829c','#afd873','#e6a6dc','#76c9a8','#d9a783','#86a5e8'];
@@ -163,44 +167,30 @@ function renderDetail(){
   $('detailContent').innerHTML=`<div class="card"><div class="detail-head"><div><span class="pill">${esc(h.exchange)} · ${esc(h.currency)}</span><h2>${esc(h.symbol)}</h2><span class="muted">${esc(h.name)}</span></div><div class="row-side"><strong class="${signClass(h.price)}">${money(h.price,h.currency)}</strong><small>As of ${esc(h.price_day||'no price')} · ${esc(h.price_source||'')}</small></div></div><div class="detail-grid"><div class="metric"><small>Current value</small><strong class="${signClass(h.value)}">${money(h.value,h.currency)}</strong></div><div class="metric"><small>Shares</small><strong>${number(h.quantity)}</strong></div><div class="metric"><small>Average cost</small><strong>${money(h.avg_cost,h.currency)}</strong></div><div class="metric"><small>Unrealised gain</small><strong class="${signClass(h.gain)}">${money(h.gain,h.currency)} · ${pct(h.gain_pct)}</strong></div></div><p class="muted fine">Average cost uses a pooled cost basis. Realised gain on sales: <span class="${signClass(h.realized)}">${money(h.realized,h.currency)}</span>. Tax reporting may use different rules.</p></div>
   <div class="card"><h2>Held through broker</h2>${h.brokers.map(b=>`<div class="row"><b>${esc(b.name)}</b><span>${number(b.quantity)} shares</span></div>`).join('')}</div>
   <div class="card"><h2>Market overview</h2><p class="muted fine">TradingView provides this chart separately. Your portfolio value uses the saved ${esc(h.price_source||"price")} dated ${esc(h.price_day||"not available")}.</p><div id="tradingViewOverview" class="tv-overview"></div></div>
-  <div class="card chart-card"><h2>Price history</h2><canvas id="detailChart" height="200" aria-label="Holding price history chart"></canvas><p class="muted fine">Daily closing prices in ${esc(h.currency)}. Missing dates have no price.</p></div>
   <div class="two-col"><div class="card"><h2>Transactions</h2>${tx.length?tx.map(t=>`<div class="row"><div class="row-main"><b>${esc(t.type)} · ${esc(t.occurred_at)}</b><small>${esc(t.account_name)} · ${number(t.quantity)} shares</small></div><div class="row-side ${signClass(cashMovement(t))}">${money(cashMovement(t),t.currency)}</div></div>`).join(''):empty('No transactions.')}</div>
   <div class="card"><h2>Documents</h2>${docs.length?docs.map(d=>`<div class="row"><div class="row-main"><b>${esc(d.title)}</b><small>${esc(d.tax_year||d.original_name)}</small></div><a href="/api/documents/${d.id}/file" target="_blank" rel="noopener">Open</a></div>`).join(''):empty('No documents attached to this holding.')}</div></div>
   <div class="card"><h2>Recent price history</h2>${priceRows.length?priceRows.map(p=>`<div class="row"><span>${esc(p.day)} <small class="muted">${esc(p.source)}</small></span><b class="${signClass(p.close)}">${money(p.close,h.currency)}</b></div>`).join(''):empty('Add prices manually or connect a delayed price feed.')}</div>`;
   renderTradingViewOverview(h);
-  requestAnimationFrame(()=>drawDetailChart(h));
 }
 function renderTradingViewOverview(h){
   const symbol=h.tv_symbol||(h.exchange==='AU'?`ASX:${h.symbol}`:`NASDAQ:${h.symbol}`);
   const target=$('tradingViewOverview');
   if(!/^[A-Z0-9.-]+:[A-Z0-9.-]+$/.test(symbol))return;
-  const container=document.createElement('div');container.className='tradingview-widget-container';
-  const widget=document.createElement('div');widget.className='tradingview-widget-container__widget';container.append(widget);
-  target.append(container);
+  // The vendor's script runs in an opaque-origin sandbox, away from our session and CSRF token.
+  const config=JSON.stringify({symbols:[[symbol,`${symbol}|1D`]],chartType:'area',lineWidth:2,colorTheme:'dark',backgroundColor:'#151e31',widgetFontColor:'#f3f6fc',fontColor:'#99aabf',gridLineColor:'#30405b',lineType:0,locale:'en',dateRanges:['1d|1','1m|30','3m|60','12m|1D','all|1M'],autosize:true,width:'100%',height:'100%'}).replace(/</g,'\\u003c');
+  const frame=document.createElement('iframe');
+  frame.title=`${symbol} TradingView symbol overview`;
+  frame.setAttribute('sandbox','allow-scripts allow-popups allow-popups-to-escape-sandbox');
+  frame.referrerPolicy='no-referrer';
+  frame.loading='lazy';
+  frame.srcdoc=`<!doctype html><html><head><meta charset="utf-8"><style>html,body{margin:0;height:100%;background:#151e31}.tradingview-widget-container,.tradingview-widget-container__widget{height:100%;width:100%}</style></head><body><div class="tradingview-widget-container"><div class="tradingview-widget-container__widget"></div><script src="https://s3.tradingview.com/external-embedding/embed-widget-symbol-overview.js">${config}<\/script></div></body></html>`;
+  target.append(frame);
   const link=document.createElement('a');
   link.className='tv-fallback';
   link.href=`https://www.tradingview.com/symbols/${symbol.replace(':','-')}/`;
   link.target='_blank';link.rel='noopener noreferrer';
   link.textContent=`View ${symbol} on TradingView ↗`;
-  container.append(link);
-  const script=document.createElement('script');script.async=true;
-  script.src='https://s3.tradingview.com/external-embedding/embed-widget-symbol-overview.js';
-  script.textContent=JSON.stringify({symbols:[[h.name,`${symbol}|1D`]],chartType:'area',lineWidth:2,colorTheme:'dark',backgroundColor:'#151e31',widgetFontColor:'#f3f6fc',fontColor:'#99aabf',gridLineColor:'#30405b',lineType:0,locale:'en',dateRanges:['1d|1','1m|30','3m|60','12m|1D','all|1M'],autosize:true,width:'100%',height:'100%'});
-  script.onerror=()=>{widget.textContent='Chart unavailable here. Use the TradingView link below.'};
-  container.append(script);
-}
-function drawDetailChart(h){
-  const c=$('detailChart');if(!c)return;const rect=c.getBoundingClientRect();if(!rect.width)return;
-  const scale=window.devicePixelRatio||1;c.width=Math.round(rect.width*scale);c.height=Math.round(rect.height*scale);
-  const ctx=c.getContext('2d');ctx.scale(scale,scale);
-  const points=h.prices.slice(-365),w=rect.width,height=rect.height;
-  if(!points.length){ctx.fillStyle='#99aabf';ctx.font='14px sans-serif';ctx.fillText('Add historical prices to see this holding’s chart',12,height/2);return}
-  let min=Math.min(...points.map(p=>p.close)),max=Math.max(...points.map(p=>p.close));if(min===max){min*=.95;max*=1.05}
-  const left=55,right=12,top=14,bottom=25;
-  ctx.fillStyle='#9aaec7';ctx.strokeStyle='#30445d';ctx.font='11px sans-serif';
-  for(let i=0;i<4;i++){let yy=top+(height-top-bottom)*i/3;ctx.beginPath();ctx.moveTo(left,yy);ctx.lineTo(w-right,yy);ctx.stroke();ctx.fillText((max-(max-min)*i/3).toFixed(2),3,yy+3)}
-  ctx.strokeStyle='#82e3d7';ctx.lineWidth=2.5;ctx.beginPath();points.forEach((p,i)=>{const x=left+(points.length===1?0:i/(points.length-1))*(w-left-right),y=top+(max-p.close)/(max-min)*(height-top-bottom);if(i)ctx.lineTo(x,y);else ctx.moveTo(x,y)});ctx.stroke();
-  ctx.fillText(points[0].day,left,height-5);if(points.length>1)ctx.fillText(points.at(-1).day,w-80,height-5);
+  target.append(link);
 }
 function editTransaction(id){
   const t=state.tx.find(t=>t.id===id);if(!t)return;
@@ -262,13 +252,14 @@ function bind(){
   $('loginForm').addEventListener('submit',e=>{e.preventDefault();(async()=>{try{const d=formData(e.target);state.auth=await api('/login','POST',d);$('loginError').textContent='';await enter()}catch(err){$('loginError').textContent=err.message}})()});
   $('logout').onclick=()=>action(async()=>{await api('/logout','POST');location.reload()});
   $('homeBrand').onclick=()=>show('overview');
+  $('settingsButton').onclick=()=>show('settings');
   $('portfolioSelect').onchange=()=>action(async()=>{state.pid=Number($('portfolioSelect').value);Object.keys(state.editing).forEach(cancelEditor);show('overview');await load()});
   document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>b.dataset.page==='admin'?showManage(state.manage):show(b.dataset.page));
   $('backToOverview').onclick=()=>show('overview');
   $('holdings').addEventListener('click',e=>{const row=e.target.closest('[data-holding]');if(row){state.selectedHolding=Number(row.dataset.holding);show('holdingDetail');renderDetail()}});
   $('holdings').addEventListener('keydown',e=>{if((e.key==='Enter'||e.key===' ')&&e.target.dataset.holding){e.preventDefault();e.target.click()}});
   $('ranges').onclick=e=>{const b=e.target.closest('[data-range]');if(!b)return;state.range=b.dataset.range;document.querySelectorAll('#ranges button').forEach(x=>x.classList.toggle('active',x===b));drawChart()};
-  window.addEventListener('resize',()=>{if(state.dashboard&&state.page==='overview')drawChart();if(state.page==='holdingDetail'){const h=state.dashboard?.holdings.find(x=>x.id===state.selectedHolding);if(h)drawDetailChart(h)}});
+  window.addEventListener('resize',()=>{if(state.dashboard&&state.page==='overview')drawChart();});
   for(const id of ['txSearch','txType','txAccount','txFrom','txTo'])$(id).addEventListener(id==='txSearch'?'input':'change',renderTransactions);
   for(const id of ['docHolding','docAccount','docYear'])$(id).addEventListener('change',renderDocs);
   $('txList').onclick=e=>action(async()=>{const edit=e.target.closest('[data-edit]'),del=e.target.closest('[data-delete]');if(edit)editTransaction(Number(edit.dataset.edit));if(del)await deleteRecord('tx',del.dataset.delete)});
@@ -318,6 +309,7 @@ function bind(){
   $('documentForm').onsubmit=e=>{e.preventDefault();action(async()=>{const data=new FormData(e.target);data.set('portfolio_id',state.pid);await api('/documents','POST',data);e.target.reset();await load();toast('Document uploaded')})};
   $('docMetaForm').onsubmit=e=>{e.preventDefault();action(async()=>{await api(`/documents/${state.editing.docMetaForm}`,'PUT',{...formData(e.target),portfolio_id:state.pid});cancelEditor('docMetaForm');await load();toast('Document updated')})};
   $('passwordForm').onsubmit=e=>{e.preventDefault();action(async()=>{await api('/change-password','POST',formData(e.target));e.target.reset();toast('Password changed')})};
+  $('resetViewerForm').onsubmit=e=>{e.preventDefault();action(async()=>{await api('/admin/reset-viewer-password','POST',formData(e.target));e.target.reset();toast('Viewer password reset; existing viewer sessions signed out')})};
   $('refreshPrices').onclick=()=>action(async()=>{const result=await api('/refresh','POST');await load();toast(`${result.provider}: updated ${result.updated.length} holdings${result.deferred.length?'; waiting: '+result.deferred.join('; '):''}${result.errors.length?'; '+result.errors.join('; '):''}`,!!result.errors.length)});
   $('refreshFx').onclick=()=>action(async()=>{const r=await api('/fx-refresh','POST');await load();toast(`USD/AUD ${r.rate} on ${r.day}`)});
   $('exportLink').onclick=e=>{e.preventDefault();window.location.href='/api'+query('/export/transactions.csv')};
