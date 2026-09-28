@@ -1,0 +1,70 @@
+services:
+  investment-dashboard:
+    image: investment-dashboard:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: investment-dashboard
+    restart: unless-stopped
+    environment:
+      DATA_DIR: /data
+      SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in Portainer}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-adam}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in Portainer}
+      VIEWER_USERNAME: ${VIEWER_USERNAME:-brother}
+      VIEWER_PASSWORD: ${VIEWER_PASSWORD:?Set VIEWER_PASSWORD in Portainer}
+      EODHD_API_KEY: ${EODHD_API_KEY:-}
+      COOKIE_SECURE: ${COOKIE_SECURE:-0}
+      TZ: Australia/Melbourne
+    ports:
+      - "${HOST_PORT:-3005}:3000"
+    volumes:
+      - ${HOST_DATA_DIR:-/home/adam/docker/investment-dashboard/data}:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:3000/api/health', timeout=5)"]
+      interval: 30s
+      timeout: 6s
+      retries: 3
+      start_period: 20s
+  price-worker:
+    image: investment-dashboard:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: portfolio-price-worker
+    restart: unless-stopped
+    environment:
+      DATA_DIR: /data
+      SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in Portainer}
+      ADMIN_USERNAME: ${ADMIN_USERNAME:-adam}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in Portainer}
+      VIEWER_USERNAME: ${VIEWER_USERNAME:-brother}
+      VIEWER_PASSWORD: ${VIEWER_PASSWORD:?Set VIEWER_PASSWORD in Portainer}
+      EODHD_API_KEY: ${EODHD_API_KEY:-}
+      REFRESH_SECONDS: ${REFRESH_SECONDS:-3600}
+      TZ: Australia/Melbourne
+    command: ["python", "worker.py"]
+    depends_on:
+      investment-dashboard:
+        condition: service_healthy
+    volumes:
+      - ${HOST_DATA_DIR:-/home/adam/docker/investment-dashboard/data}:/data
+  backup:
+    image: investment-dashboard:local
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: portfolio-backup
+    restart: unless-stopped
+    environment:
+      DATA_DIR: /data
+      BACKUP_DIR: /backups
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-30}
+      TZ: Australia/Melbourne
+    command: ["python", "backup.py"]
+    depends_on:
+      investment-dashboard:
+        condition: service_healthy
+    volumes:
+      - ${HOST_DATA_DIR:-/home/adam/docker/investment-dashboard/data}:/data:ro
+      - ${HOST_BACKUP_DIR:-/home/adam/docker/investment-dashboard/backups}:/backups
