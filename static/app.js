@@ -1,5 +1,5 @@
 const $ = id => document.getElementById(id);
-const state = { auth:null, pid:null, setup:null, dashboard:null, tx:[], docs:[], recon:[], prices:[], fx:[], page:'overview', manage:'trades', range:'30', chartMode:'value', showAllPrices:false, editing:{}, selectedHolding:null };
+const state = { auth:null, pid:null, setup:null, dashboard:null, tx:[], docs:[], recon:[], prices:[], fx:[], drp:[], report:null, reportYear:null, importToken:null, page:'overview', manage:'trades', range:'30', chartMode:'value', showAllPrices:false, editing:{}, selectedHolding:null };
 const types = ['buy','sell','deposit','withdrawal','dividend','interest','fee','transfer','fx','split','adjustment_in','adjustment_out'];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, x => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[x]));
 const money = (n,c='AUD') => n == null || !Number.isFinite(Number(n)) ? '—' : new Intl.NumberFormat('en-AU',{style:'currency',currency:c,maximumFractionDigits:2}).format(n);
@@ -48,10 +48,13 @@ function showManage(panel='trades'){
   document.querySelectorAll('[data-panel]').forEach(el=>el.hidden=el.dataset.panel!==panel);
 }
 async function load(){
-  const [setup,dashboard,tx,docs,recon,prices,fx]=await Promise.all([
+  const [setup,dashboard,tx,docs,recon,prices,fx,drp]=await Promise.all([
     api(query('/setup')),api(query('/dashboard')),api(query('/transactions')),api(query('/documents')),state.auth.role==='admin'?api(query('/reconciliations')):Promise.resolve([]),
-    state.auth.role==='admin'?api('/prices'):Promise.resolve([]),state.auth.role==='admin'?api('/fx-rates'):Promise.resolve([])]);
-  Object.assign(state,{setup,dashboard,tx,docs,recon,prices,fx});
+    state.auth.role==='admin'?api('/prices'):Promise.resolve([]),state.auth.role==='admin'?api('/fx-rates'):Promise.resolve([]),api(query('/reinvestments'))]);
+  Object.assign(state,{setup,dashboard,tx,docs,recon,prices,fx,drp});
+  const currentYear=Number(melbourneDay().slice(0,4))+(melbourneDay().slice(5,7)>='07'?1:0);
+  if(!state.reportYear)state.reportYear=currentYear;
+  state.report=await api(query(`/financial-year?end_year=${state.reportYear}`));
   $('portfolioName').textContent=setup.portfolios.find(p=>p.id===state.pid)?.name+'’s portfolio';
   const missing=dashboard.holdings.filter(h=>!h.price_day).map(h=>h.symbol);
   const dated=dashboard.holdings.map(h=>h.price_day).filter(Boolean).sort();
@@ -59,7 +62,7 @@ async function load(){
   const stamp=missing.length?`Missing prices: ${missing.join(', ')}`:dated.length?`Oldest holding price: ${dated[0]}`:'No holding prices yet';
   $('dataStamp').textContent=stamp+(stale.length?` · Check ${stale.join(', ')}`:'');
   $('dataStamp').classList.toggle('down',Boolean(missing.length||stale.length));
-  renderOptions();updateTypeFields();renderOverview();renderTransactions();renderCash();renderDocs();renderRecon();renderManage();
+  renderOptions();updateTypeFields();renderOverview();renderTransactions();renderCash();renderDocs();renderReport();renderRecon();renderManage();
   if(state.page==='holdingDetail')renderDetail();
 }
 function renderOptions(){
@@ -67,11 +70,11 @@ function renderOptions(){
   for(const id of ['txAccount','docAccount'])options($(id),accounts,a=>`${a.name} · ${a.currency}`,'All accounts');
   options($('docHolding'),instruments,i=>`${i.symbol} · ${i.name}`,'All holdings');
   if(state.auth.role==='admin'){
-    for(const form of [$('txForm'),$('cashForm'),$('documentForm'),$('docMetaForm'),$('reconForm')])
+    for(const form of [$('txForm'),$('cashForm'),$('reinvestForm'),$('documentForm'),$('docMetaForm'),$('reconForm')])
       options(field(form,'account_id'),accounts,a=>`${a.name} · ${a.currency}`,
               form===$('documentForm')||form===$('docMetaForm')?'None':'Choose account');
     options(field($('cashForm'),'target_account_id'),accounts,a=>`${a.name} · ${a.currency}`,'Choose destination');
-    for(const form of [$('txForm'),$('cashForm'),$('documentForm'),$('docMetaForm'),$('priceForm')])
+    for(const form of [$('txForm'),$('cashForm'),$('reinvestForm'),$('documentForm'),$('docMetaForm'),$('priceForm')])
       options(field(form,'instrument_id'),instruments,i=>`${i.symbol} · ${i.name}`,
               form===$('documentForm')||form===$('docMetaForm')?'None':'Choose holding');
     field($('portfolioForm'),'name').value=state.setup.portfolios.find(p=>p.id===state.pid)?.name||'';
@@ -88,6 +91,13 @@ function renderOverview(){
   $('totalContext').textContent=d.value==null?'Add prices and a USD/AUD rate to complete the valuation':`AUD · investments and cash${d.fx_rate?` · USD/AUD ${number(d.fx_rate)} (${d.fx_day})`:''}`;
   $('profit').textContent=money(d.profit);$('profit').className=signClass(d.profit);
   $('dayChange').textContent=money(d.session_move);$('dayChange').className=signClass(d.session_move);
+  $('xirrReturn').textContent=pct(d.returns?.xirr_pct);$('xirrReturn').className=signClass(d.returns?.xirr_pct);
+  $('twrReturn').textContent=pct(d.returns?.twr_pct);$('twrReturn').className=signClass(d.returns?.twr_pct);
+  $('returnHelp').textContent=state.tx.some(t=>t.type.startsWith('adjustment_'))?'Cash corrections can distort returns. Check missing deposits and balance adjustments.':'Returns require complete deposits and dated prices. Money-weighted return is annualised; time-weighted return is cumulative.';
+  const missingDeposits=state.tx.some(t=>t.type==='buy')&&!state.tx.some(t=>t.type==='deposit');
+  const corrections=state.tx.filter(t=>t.type.startsWith('adjustment_')).length;
+  $('ledgerWarning').hidden=!missingDeposits;
+  if(missingDeposits)$('ledgerWarning').textContent=`Trades exist but no deposits are recorded in this portfolio. Historical cash, the value chart and returns may be inaccurate.${corrections?` There are also ${corrections} cash corrections that may be filling those gaps.`:''} Review the original funding dates in Transactions and the balance checks.`;
   $('holdings').innerHTML=d.holdings.length?d.holdings.map(h=>`<div class="row clickable" data-holding="${h.id}" tabindex="0" role="button"><div class="row-main"><b>${esc(h.symbol)} <span class="pill">${esc(h.exchange)}</span></b><small>${esc(h.name)} · ${number(h.quantity)} shares · ${esc(h.brokers.map(b=>b.name).join(', '))}</small></div><div class="row-side"><b class="${signClass(h.value)}">${money(h.value,h.currency)}</b><small>${money(h.price,h.currency)} / share · ${esc(h.price_day||'no price date')} · <span class="${signClass(h.gain_pct)}">${pct(h.gain_pct)}</span></small></div></div>`).join(''):empty('No holdings yet. Add an account, a holding and a buy transaction in Manage.');
   const valued=d.holdings.filter(h=>h.value>0&&(h.currency!=='USD'||d.fx_rate>0)).map(h=>({...h,aud:h.value*(h.currency==='USD'?d.fx_rate:1)}));
   const total=valued.reduce((s,h)=>s+h.aud,0);
@@ -119,14 +129,15 @@ function drawChart(){
   if(min<0&&max>0){ctx.strokeStyle='#66758e';ctx.setLineDash([4,4]);ctx.beginPath();ctx.moveTo(left,y(0));ctx.lineTo(w-right,y(0));ctx.stroke();ctx.setLineDash([])}
   ctx.strokeStyle=state.chartMode==='profit'?'#b6a5eb':'#81e3d7';ctx.lineWidth=2.5;ctx.beginPath();let drawing=false;
   points.forEach((p,i)=>{const v=measure(p);if(v==null){drawing=false;return}if(!drawing)ctx.moveTo(x(i),y(v));else ctx.lineTo(x(i),y(v));drawing=true});ctx.stroke();
+  points.forEach((p,i)=>{const prev=series[start+i-1],v=measure(p);if(v==null||!prev||p.invested==null||prev.invested==null||Math.abs(p.invested-prev.invested)<.005)return;ctx.fillStyle='#b6a5eb';ctx.beginPath();ctx.arc(x(i),y(v),3.5,0,Math.PI*2);ctx.fill()});
   const hover=state.chartHover;
-  if(hover!=null){const i=Math.max(0,Math.min(points.length-1,Math.round((hover-left)/(w-left-right)*(points.length-1))));const p=points[i];if(p){$('chartReading').textContent=`${p.day} · Value ${money(p.value)} · Net contributions ${money(p.invested)} · Profit ${money(p.value==null||p.invested==null?null:p.value-p.invested)}`;const v=measure(p);if(v!=null){ctx.strokeStyle='#7a8ba5';ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(x(i),top);ctx.lineTo(x(i),h-bottom);ctx.stroke();ctx.fillStyle='#ffffff';ctx.beginPath();ctx.arc(x(i),y(v),4,0,Math.PI*2);ctx.fill()}}}
+  if(hover!=null){const i=Math.max(0,Math.min(points.length-1,Math.round((hover-left)/(w-left-right)*(points.length-1))));const p=points[i];if(p){const prev=series[start+i-1],contributionChange=prev?.invested!=null&&p.invested!=null?p.invested-prev.invested:null;$('chartReading').textContent=`${p.day} · Value ${money(p.value)} · Net contributions ${money(p.invested)} · Profit ${money(p.value==null||p.invested==null?null:p.value-p.invested)}${contributionChange!=null&&Math.abs(contributionChange)>=.005?` · Contribution change ${money(contributionChange)}`:''}`;const v=measure(p);if(v!=null){ctx.strokeStyle='#7a8ba5';ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(x(i),top);ctx.lineTo(x(i),h-bottom);ctx.stroke();ctx.fillStyle='#ffffff';ctx.beginPath();ctx.arc(x(i),y(v),4,0,Math.PI*2);ctx.fill()}}}
   ctx.fillStyle='#95a7c0';ctx.fillText(points[0].day,left,h-5);if(points.length>1)ctx.fillText(points.at(-1).day,w-80,h-5);
 }
 function renderTransactions(){
   const term=$('txSearch').value.toLowerCase(),type=$('txType').value,account=$('txAccount').value,from=$('txFrom').value,to=$('txTo').value;
   const items=state.tx.filter(t=>(!type||t.type===type)&&(!account||String(t.account_id)===account)&&(!from||t.occurred_at>=from)&&(!to||t.occurred_at<=to)&&(!term||`${t.symbol||''} ${t.account_name} ${t.note} ${t.type}`.toLowerCase().includes(term)));
-  $('txList').innerHTML=items.length?items.map(t=>`<div class="row"><div class="row-main"><b>${esc(t.type.replaceAll('_',' ').toUpperCase())} ${esc(t.symbol||'')}</b><small>${esc(t.occurred_at)} · ${esc(t.account_name)}${t.target_account_name?' → '+esc(t.target_account_name):''}${t.note?' · '+esc(t.note):''}</small><small>${t.quantity?number(t.quantity)+' × '+money(t.price,t.currency):''}${t.tax?' · tax '+money(t.tax,t.currency):''}${t.fee?' · fee '+money(t.fee,t.currency):''}</small></div><div class="row-side"><b class="${signClass(cashMovement(t))}">${money(cashMovement(t),t.currency)}</b>${state.auth.role==='admin'?state.recon.some(r=>r.adjustment_transaction_id===t.id)?'<small>Managed by its balance check</small>':`<small><button data-edit="${t.id}">Edit</button> <button data-delete="${t.id}">Delete</button></small>`:''}</div></div>`).join(''):empty('No matching transactions.');
+  $('txList').innerHTML=items.length?items.map(t=>{const group=state.drp.find(r=>r.dividend_transaction_id===t.id||r.buy_transaction_id===t.id);return `<div class="row"><div class="row-main"><b>${esc(t.type.replaceAll('_',' ').toUpperCase())} ${esc(t.symbol||'')}${group?' · Reinvested':''}</b><small>${esc(t.occurred_at)} · ${esc(t.account_name)}${t.target_account_name?' → '+esc(t.target_account_name):''}${t.note?' · '+esc(t.note):''}</small><small>${t.quantity?number(t.quantity)+' × '+money(t.price,t.currency):''}${t.tax?' · tax '+money(t.tax,t.currency):''}${t.fee?' · fee '+money(t.fee,t.currency):''}</small></div><div class="row-side"><b class="${signClass(cashMovement(t))}">${money(cashMovement(t),t.currency)}</b>${state.auth.role==='admin'?group?`<small><button data-edit-drp="${group.id}">Edit reinvestment</button></small>`:state.recon.some(r=>r.adjustment_transaction_id===t.id)?'<small>Managed by its balance check</small>':`<small><button data-edit="${t.id}">Edit</button> <button data-delete="${t.id}">Delete</button></small>`:''}</div></div>`}).join(''):empty('No matching transactions.');
 }
 function renderCash(){
   const d=state.dashboard;
@@ -136,6 +147,19 @@ function renderDocs(){
   const hid=$('docHolding').value,aid=$('docAccount').value,year=$('docYear').value;
   const data=state.docs.filter(d=>(!hid||String(d.instrument_id)===hid)&&(!aid||String(d.account_id)===aid)&&(!year||d.tax_year===year));
   $('docList').innerHTML=data.length?data.map(d=>`<div class="row"><div class="row-main"><b>${esc(d.title)}</b><small>${esc([d.symbol,d.account_name,d.tax_year,d.original_name].filter(Boolean).join(' · '))}</small></div><div class="row-side"><a href="/api/documents/${d.id}/file" target="_blank" rel="noopener">Open</a>${state.auth.role==='admin'?` <button data-edit-doc="${d.id}">Edit</button> <button data-delete-doc="${d.id}">Delete</button>`:''}</div></div>`).join(''):empty('No documents match these filters.');
+}
+function renderReport(){
+  const r=state.report;if(!r)return;
+  const currentYear=Number(melbourneDay().slice(0,4))+(melbourneDay().slice(5,7)>='07'?1:0);
+  const earliest=state.tx.reduce((year,t)=>Math.min(year,Number(t.occurred_at.slice(0,4))+(t.occurred_at.slice(5,7)>='07'?1:0)),currentYear);
+  $('reportYear').innerHTML=Array.from({length:currentYear-earliest+1},(_,i)=>currentYear-i).map(y=>`<option value="${y}">${y-1}–${String(y).slice(-2)}</option>`).join('');
+  $('reportYear').value=String(state.reportYear);
+  $('downloadReport').href='/api'+query(`/financial-year.csv?end_year=${state.reportYear}`);
+  const card=(label,value)=>`<div class="metric"><small>${esc(label)}</small><strong class="${signClass(value)}">${money(value)}</strong></div>`;
+  const table=(headers,rows)=>rows.length?`<div class="report-scroll"><table class="report-table"><thead><tr>${headers.map(h=>`<th>${esc(h)}</th>`).join('')}</tr></thead><tbody>${rows.join('')}</tbody></table></div>`:empty('No entries for this year.');
+  const sales=table(['Sold','Holding','Account','Acquired','Units','Proceeds','Cost','Gain','12 months'],r.sales.map(s=>`<tr><td>${esc(s.sold)}</td><td>${esc(s.symbol)}</td><td>${esc(s.account_name)}</td><td>${esc(s.acquired)}</td><td>${number(s.quantity)}</td><td>${money(s.proceeds_aud)}</td><td>${money(s.cost_aud)}</td><td class="${signClass(s.gain_aud)}">${money(s.gain_aud)}</td><td>${s.discount_eligible?'Eligible*':'No'}</td></tr>`));
+  const income=table(['Date','Type','Holding','Gross AUD','Withheld AUD','Franking AUD'],r.income.map(x=>`<tr><td>${esc(x.day)}</td><td>${esc(x.type)}</td><td>${esc(x.symbol||'—')}</td><td>${money(x.gross_aud)}</td><td>${money(x.withheld_aud)}</td><td>${money(x.franking_aud)}</td></tr>`));
+  $('financialReport').innerHTML=`${r.issues.length?`<div class="empty down"><strong>Review before using this report:</strong><ul>${r.issues.map(i=>`<li>${esc(i)}</li>`).join('')}</ul></div>`:''}<div class="report-grid">${card('Realised gains before discount',r.totals.realised_gain_aud??0)}${card('Dividend income',r.totals.dividend_aud??0)}${card('Interest',r.totals.interest_aud??0)}${card('Tax withheld',r.totals.withheld_aud??0)}${card('Franking credits',r.totals.franking_credit_aud??0)}${card('Other fees',r.totals.other_fees_aud??0)}</div><h3>Sales by purchase parcel</h3>${sales}<p class="muted fine">*12-month eligibility is informational. Losses, trust treatment, ETF AMMA adjustments, FX, and parcel selection need separate review. No CGT discount or tax payable is calculated.</p><h3>Income transactions</h3>${income}`;
 }
 function renderRecon(){
   const byAccount=new Map(state.dashboard.cash.map(a=>[a.id,a]));
@@ -153,8 +177,10 @@ function renderManage(){
   const editDelete=(kind,id)=>`<button data-edit-${kind}="${id}">Edit</button><button class="danger" data-delete-${kind}="${id}">Delete</button>`;
   const trade=state.tx.filter(t=>['buy','sell','split'].includes(t.type)).slice(0,6);
   const cash=state.tx.filter(t=>!['buy','sell','split'].includes(t.type)).slice(0,6);
-  $('recentTrades').innerHTML=trade.length?trade.map(t=>record(`${t.type.toUpperCase()} ${t.symbol||''}`,`${t.occurred_at} · ${t.account_name} · ${number(t.quantity)} shares`,editDelete('tx',t.id))).join(''):empty('No trades yet.');
-  $('recentCash').innerHTML=cash.length?cash.map(t=>record(`${t.type.replaceAll('_',' ').toUpperCase()} · ${money(cashMovement(t),t.currency)}`,`${t.occurred_at} · ${t.account_name}`,state.recon.some(r=>r.adjustment_transaction_id===t.id)?'<small>Managed in Balance checks</small>':editDelete('tx',t.id),cashMovement(t))).join(''):empty('No cash activity yet.');
+  const linked=t=>state.drp.find(r=>r.dividend_transaction_id===t.id||r.buy_transaction_id===t.id);
+  $('recentTrades').innerHTML=trade.length?trade.map(t=>record(`${t.type.toUpperCase()} ${t.symbol||''}`,`${t.occurred_at} · ${t.account_name} · ${number(t.quantity)} shares`,linked(t)?`<button data-edit-drp="${linked(t).id}">Edit reinvestment</button>`:editDelete('tx',t.id))).join(''):empty('No trades yet.');
+  $('recentCash').innerHTML=cash.length?cash.map(t=>record(`${t.type.replaceAll('_',' ').toUpperCase()} · ${money(cashMovement(t),t.currency)}`,`${t.occurred_at} · ${t.account_name}`,linked(t)?`<button data-edit-drp="${linked(t).id}">Edit reinvestment</button>`:state.recon.some(r=>r.adjustment_transaction_id===t.id)?'<small>Managed in Balance checks</small>':editDelete('tx',t.id),cashMovement(t))).join(''):empty('No cash activity yet.');
+  $('reinvestList').innerHTML=state.drp.length?state.drp.map(r=>record(`${r.symbol} · ${number(r.quantity)} shares`,`${r.dividend_day} dividend ${money(r.amount,r.currency)} · allotted ${r.buy_day} at ${money(r.price,r.currency)}`,`<button data-edit-drp="${r.id}">Edit</button><button class="danger" data-delete-drp="${r.id}">Delete</button>`)).join(''):empty('No dividend reinvestments recorded.');
   $('accountManageList').innerHTML=state.setup.accounts.length?state.setup.accounts.map(a=>{const cash=state.dashboard.cash.find(x=>x.id===a.id)?.balance;return record(`${a.name} · ${money(cash,a.currency)}`,`${a.broker||a.kind} · ${a.currency} · cash available`,editDelete('account',a.id),cash)}).join(''):empty('No accounts in this portfolio.');
   $('instrumentManageList').innerHTML=state.setup.instruments.length?state.setup.instruments.map(i=>record(i.symbol,`${i.name} · ${i.exchange}`,editDelete('instrument',i.id))).join(''):empty('No holdings added.');
   const seenPrices=new Set();
@@ -163,7 +189,7 @@ function renderManage(){
   $('togglePriceHistory').textContent=state.showAllPrices?'Show latest only':'Show all prices';
   const visiblePrices=state.showAllPrices?state.prices:latest;
   $('priceManageList').innerHTML=visiblePrices.length?visiblePrices.map(p=>record(`${p.symbol} · ${money(p.close,p.currency)}`,`${p.day} · ${p.source}`,`<button data-edit-price="${p.instrument_id}|${p.day}">Edit</button><button class="danger" data-delete-price="${p.instrument_id}|${p.day}">Delete</button>`,p.close)).join(''):empty('No prices recorded.');
-  $('fxManageList').innerHTML=state.fx.length?state.fx.map(x=>record(`${number(x.usd_aud)} AUD / USD`,`${x.day} · ${x.source}`,`<button data-edit-fx="${x.day}">Edit</button><button class="danger" data-delete-fx="${x.day}">Delete</button>`)).join(''):empty('No exchange rates recorded.');
+  $('fxManageList').innerHTML=state.fx.length?state.fx.slice(0,3).map(x=>record(`${number(x.usd_aud)} AUD / USD`,`${x.day} · ${x.source}`,`<button data-edit-fx="${x.day}">Edit</button><button class="danger" data-delete-fx="${x.day}">Delete</button>`)).join(''):empty('No exchange rates recorded.');
   $('manageDocs').innerHTML=state.docs.length?state.docs.map(d=>record(d.title,[d.symbol,d.account_name,d.tax_year].filter(Boolean).join(' · '),`<a href="/api/documents/${d.id}/file" target="_blank" rel="noopener">Open</a> ${editDelete('doc',d.id)}`)).join(''):empty('No documents yet.');
   $('manageChecks').innerHTML=state.recon.length?state.recon.map(r=>record(r.account_name,`${r.day} · cash ${money(r.reported_value,r.currency)}`,editDelete('recon',r.id),r.reported_value)).join(''):empty('No balance checks yet.');
 }
@@ -209,6 +235,22 @@ function editTransaction(id){
   if(t.note)form.querySelector('details')?.setAttribute('open','');
   form.scrollIntoView({behavior:'smooth',block:'start'});
 }
+function reinvestSummary(){
+  const d=formData($('reinvestForm'));
+  const account=state.setup?.accounts.find(a=>String(a.id)===d.account_id);
+  const currency=account?.currency||'AUD';
+  const net=Number(d.amount||0)-Number(d.tax||0);
+  const cost=Number(d.quantity||0)*Number(d.price||0)+Number(d.fee||0);
+  $('reinvestPreview').textContent=`Net dividend ${money(net,currency)} · shares and brokerage ${money(cost,currency)} · ${net>=cost?'cash left over':'additional cash used'} ${money(Math.abs(net-cost),currency)}. Franking credits do not add cash.`;
+}
+function editReinvestment(id){
+  const r=state.drp.find(x=>x.id===id);if(!r)return;
+  showManage('reinvest');state.editing.reinvestForm=id;
+  populate($('reinvestForm'),r);
+  $('reinvestFormTitle').textContent='Edit dividend reinvestment';
+  $('cancelReinvest').hidden=false;reinvestSummary();
+  $('reinvestForm').scrollIntoView({behavior:'smooth',block:'start'});
+}
 async function action(fn){try{await fn()}catch(e){toast(e.message,true)}}
 function populate(form,data){for(const [key,value] of Object.entries(data)){const el=field(form,key);if(el)el.value=value??''}}
 function resetForm(form){form.reset();form.querySelectorAll('input[type="date"]').forEach(el=>el.value=melbourneDay());form.querySelector('details')?.removeAttribute('open')}
@@ -219,12 +261,13 @@ function updateReconFields(){
 }
 function cancelEditor(id){
   const form=$(id);delete state.editing[id];resetForm(form);
-  const title={txForm:'Record a trade',cashForm:'Record cash activity',accountForm:'Add account',instrumentForm:'Add holding',reconForm:'Add balance check'};
-  if(title[id])$(id==='txForm'?'txFormTitle':id==='cashForm'?'cashFormTitle':id==='accountForm'?'accountFormTitle':id==='instrumentForm'?'instrumentFormTitle':'reconFormTitle').textContent=title[id];
-  const cancel=form.querySelector('[data-cancel],#cancelEdit,#cancelCashEdit');if(cancel)cancel.hidden=true;
+  const title={txForm:'Record a trade',cashForm:'Record cash activity',reinvestForm:'Record dividend reinvestment',accountForm:'Add account',instrumentForm:'Add holding',reconForm:'Add balance check'};
+  if(title[id])$(id==='txForm'?'txFormTitle':id==='cashForm'?'cashFormTitle':id==='reinvestForm'?'reinvestFormTitle':id==='accountForm'?'accountFormTitle':id==='instrumentForm'?'instrumentFormTitle':'reconFormTitle').textContent=title[id];
+  const cancel=form.querySelector('[data-cancel],#cancelEdit,#cancelCashEdit,#cancelReinvest');if(cancel)cancel.hidden=true;
   if(id==='docMetaForm')form.hidden=true;
   updateTypeFields();
   if(id==='reconForm')updateReconFields();
+  if(id==='reinvestForm')reinvestSummary();
 }
 function updateTypeFields(){
   const trade=$('editType').value,kind=$('cashType').value;
@@ -260,20 +303,24 @@ function bind(){
   $('logout').onclick=()=>action(async()=>{await api('/logout','POST');location.reload()});
   $('homeBrand').onclick=()=>show('overview');
   $('settingsButton').onclick=()=>show('settings');
-  $('portfolioSelect').onchange=()=>action(async()=>{state.pid=Number($('portfolioSelect').value);Object.keys(state.editing).forEach(cancelEditor);show('overview');await load()});
+  $('portfolioSelect').onchange=()=>action(async()=>{state.pid=Number($('portfolioSelect').value);state.importToken=null;$('commitImport').hidden=true;$('importPreview').innerHTML='';Object.keys(state.editing).forEach(cancelEditor);show('overview');await load()});
   document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>b.dataset.page==='admin'?showManage(state.manage):show(b.dataset.page));
   $('backToOverview').onclick=()=>show('overview');
   $('holdings').addEventListener('click',e=>{const row=e.target.closest('[data-holding]');if(row){state.selectedHolding=Number(row.dataset.holding);show('holdingDetail');renderDetail()}});
   $('holdings').addEventListener('keydown',e=>{if((e.key==='Enter'||e.key===' ')&&e.target.dataset.holding){e.preventDefault();e.target.click()}});
   $('ranges').onclick=e=>{const b=e.target.closest('[data-range]');if(!b)return;state.range=b.dataset.range;document.querySelectorAll('#ranges button').forEach(x=>x.classList.toggle('active',x===b));drawChart()};
   $('chartModes').onclick=e=>{const b=e.target.closest('[data-mode]');if(!b)return;state.chartMode=b.dataset.mode;document.querySelectorAll('#chartModes button').forEach(x=>x.classList.toggle('active',x===b));$('chartDescription').textContent=state.chartMode==='profit'?'Portfolio value minus net external contributions, AUD':'Portfolio value in AUD, including cash and deposits';$('chart').setAttribute('aria-label',state.chartMode==='profit'?'Portfolio profit chart':'Portfolio value chart');drawChart()};
-  $('chart').addEventListener('mousemove',e=>{state.chartHover=e.clientX-$('chart').getBoundingClientRect().left;drawChart()});
-  $('chart').addEventListener('mouseleave',()=>{state.chartHover=null;$('chartReading').textContent='Move over the chart to see the date, value and net contributions.';drawChart()});
+  $('chart').addEventListener('pointermove',e=>{state.chartHover=e.clientX-$('chart').getBoundingClientRect().left;drawChart()});
+  $('chart').addEventListener('pointerleave',()=>{state.chartHover=null;$('chartReading').textContent='Move over the chart to see the date, value and net contributions.';drawChart()});
   $('togglePriceHistory').onclick=()=>{state.showAllPrices=!state.showAllPrices;renderManage()};
   window.addEventListener('resize',()=>{if(state.dashboard&&state.page==='overview')drawChart();});
   for(const id of ['txSearch','txType','txAccount','txFrom','txTo'])$(id).addEventListener(id==='txSearch'?'input':'change',renderTransactions);
   for(const id of ['docHolding','docAccount','docYear'])$(id).addEventListener('change',renderDocs);
-  $('txList').onclick=e=>action(async()=>{const edit=e.target.closest('[data-edit]'),del=e.target.closest('[data-delete]');if(edit)editTransaction(Number(edit.dataset.edit));if(del)await deleteRecord('tx',del.dataset.delete)});
+  $('reportYear').onchange=()=>action(async()=>{state.reportYear=Number($('reportYear').value);state.report=await api(query(`/financial-year?end_year=${state.reportYear}`));renderReport()});
+  $('importForm').elements.namedItem('file').onchange=()=>{state.importToken=null;$('commitImport').hidden=true;$('importPreview').innerHTML=''};
+  $('importForm').onsubmit=e=>{e.preventDefault();action(async()=>{const data=new FormData(e.target);data.set('portfolio_id',state.pid);const r=await api('/import/preview','POST',data);state.importToken=r.token;$('importPreview').innerHTML=`<p class="muted">${r.ready} ready · ${r.duplicates} already present · ${r.errors} errors. Cash corrections are skipped.</p>`+r.rows.map(x=>`<div class="row"><span>${esc(x.summary)} <small class="muted">${esc(x.detail)}</small></span><b class="${x.status==='error'?'down':x.status==='ready'?'up':''}">${esc(x.status)}</b></div>`).join('');$('commitImport').hidden=!r.ready||!!r.errors})};
+  $('commitImport').onclick=()=>action(async()=>{if(!state.importToken)return;const data=new FormData($('importForm'));data.set('portfolio_id',state.pid);data.set('token',state.importToken);const r=await api('/import/commit','POST',data);state.importToken=null;$('commitImport').hidden=true;$('importForm').reset();$('importPreview').innerHTML=empty(`Imported ${r.imported} transactions; skipped ${r.skipped}.`);await load();toast(`${r.imported} transactions imported`) });
+  $('txList').onclick=e=>action(async()=>{const group=e.target.closest('[data-edit-drp]'),edit=e.target.closest('[data-edit]'),del=e.target.closest('[data-delete]');if(group)editReinvestment(Number(group.dataset.editDrp));if(edit)editTransaction(Number(edit.dataset.edit));if(del)await deleteRecord('tx',del.dataset.delete)});
   $('docList').onclick=e=>action(async()=>{const edit=e.target.closest('[data-edit-doc]'),del=e.target.closest('[data-delete-doc]');if(edit)editDocument(Number(edit.dataset.editDoc));if(del)await deleteRecord('doc',del.dataset.deleteDoc)});
   $('reconList').onclick=e=>action(async()=>{
     const edit=e.target.closest('[data-edit-recon]'),del=e.target.closest('[data-delete-recon]'),match=e.target.closest('[data-match-recon]');
@@ -290,20 +337,25 @@ function bind(){
   document.querySelectorAll('[data-manage]').forEach(b=>b.onclick=()=>showManage(b.dataset.manage));
   document.querySelectorAll('[data-goto]').forEach(b=>b.onclick=()=>show(b.dataset.goto));
   document.querySelectorAll('[data-cancel]').forEach(b=>b.onclick=()=>cancelEditor(b.dataset.cancel));
-  $('cancelEdit').onclick=()=>cancelEditor('txForm');$('cancelCashEdit').onclick=()=>cancelEditor('cashForm');
+  $('cancelEdit').onclick=()=>cancelEditor('txForm');$('cancelCashEdit').onclick=()=>cancelEditor('cashForm');$('cancelReinvest').onclick=()=>cancelEditor('reinvestForm');
+  $('reinvestForm').addEventListener('input',reinvestSummary);
+  $('reinvestForm').addEventListener('change',reinvestSummary);
+  $('reinvestForm').onsubmit=e=>{e.preventDefault();action(async()=>{const id=state.editing.reinvestForm;await api(id?`/reinvestments/${id}`:'/reinvestments',id?'PUT':'POST',{...formData(e.target),portfolio_id:state.pid});cancelEditor('reinvestForm');await load();toast(id?'Reinvestment updated':'Dividend and shares recorded')})};
   $('editType').onchange=updateTypeFields;$('cashType').onchange=updateTypeFields;field($('cashForm'),'account_id').onchange=updateTypeFields;
   field($('reconForm'),'day').onchange=updateReconFields;
   $('admin').onclick=e=>action(async()=>{
-    const b=e.target.closest('button[data-edit-tx],button[data-delete-tx],button[data-edit-account],button[data-delete-account],button[data-edit-instrument],button[data-delete-instrument],button[data-edit-price],button[data-delete-price],button[data-edit-fx],button[data-delete-fx],button[data-edit-doc],button[data-delete-doc],button[data-edit-recon],button[data-delete-recon]');
+    const b=e.target.closest('button[data-edit-tx],button[data-delete-tx],button[data-edit-drp],button[data-delete-drp],button[data-edit-account],button[data-delete-account],button[data-edit-instrument],button[data-delete-instrument],button[data-edit-price],button[data-delete-price],button[data-edit-fx],button[data-delete-fx],button[data-edit-doc],button[data-delete-doc],button[data-edit-recon],button[data-delete-recon]');
     if(!b)return;
     const attr=b.getAttributeNames().find(x=>x.startsWith('data-edit-')||x.startsWith('data-delete-'));
     const [op,kind]=attr.slice(5).split('-'),id=b.getAttribute(attr);
     if(op==='delete'){
+      if(kind==='drp'){if(confirm('Delete both the dividend and share purchase? This can affect cash, holdings and reports.')){await api(query(`/reinvestments/${id}`),'DELETE');await load();toast('Reinvestment deleted')}return}
       if(kind==='price'){const [iid,day]=id.split('|');if(confirm('Delete this price?')){await api(`/prices/${iid}/${day}`,'DELETE');await load();toast('Deleted')}return}
       if(kind==='fx'){if(confirm('Delete this exchange rate?')){await api(`/fx-rate/${id}`,'DELETE');await load();toast('Deleted')}return}
       await deleteRecord(kind,id);return;
     }
     if(kind==='tx'){editTransaction(Number(id));return}
+    if(kind==='drp'){editReinvestment(Number(id));return}
     if(kind==='doc'){editDocument(Number(id));return}
     if(kind==='recon'){editRecon(Number(id));return}
     if(kind==='account'){const x=state.setup.accounts.find(a=>a.id===Number(id));if(x)startEdit('accountForm',x,'accountFormTitle','Edit account','accounts');return}
@@ -312,7 +364,7 @@ function bind(){
     if(kind==='fx'){const f=state.fx.find(x=>x.day===id);if(f){populate($('fxForm'),f);$('fxForm').scrollIntoView({behavior:'smooth',block:'start'});toast('Change the rate and save to update it')}}
   });
   $('txForm').onsubmit=e=>{e.preventDefault();action(async()=>{const form=e.target,d=formData(form),id=state.editing.txForm;d.portfolio_id=state.pid;d.amount=0;d.target_amount=0;d.tax=0;d.target_account_id='';d.fx_rate=0;if(d.type==='split'){d.price=0;d.fee=0}await api(id?`/transactions/${id}`:'/transactions',id?'PUT':'POST',d);cancelEditor('txForm');await load();toast(id?'Trade updated':'Trade saved')})};
-  $('cashForm').onsubmit=e=>{e.preventDefault();action(async()=>{const form=e.target,d=formData(form),id=state.editing.cashForm;d.portfolio_id=state.pid;d.quantity=0;d.price=0;if(d.type!=='dividend'){d.instrument_id='';d.tax=0}if(!['transfer','fx'].includes(d.type)){d.target_account_id='';d.target_amount=0;d.fee=0}if(d.type!=='fx')d.target_amount=0;if(!['deposit','withdrawal'].includes(d.type))d.fx_rate=0;await api(id?`/transactions/${id}`:'/transactions',id?'PUT':'POST',d);cancelEditor('cashForm');await load();toast(id?'Activity updated':'Activity saved')})};
+  $('cashForm').onsubmit=e=>{e.preventDefault();action(async()=>{const form=e.target,d=formData(form),id=state.editing.cashForm;d.portfolio_id=state.pid;d.quantity=0;d.price=0;if(d.type!=='dividend'){d.instrument_id='';d.tax=0;d.franking_credit=0}if(!['transfer','fx'].includes(d.type)){d.target_account_id='';d.target_amount=0;d.fee=0}if(d.type!=='fx')d.target_amount=0;if(!['deposit','withdrawal'].includes(d.type))d.fx_rate=0;await api(id?`/transactions/${id}`:'/transactions',id?'PUT':'POST',d);cancelEditor('cashForm');await load();toast(id?'Activity updated':'Activity saved')})};
   for(const [id,path] of [['accountForm','/accounts'],['instrumentForm','/instruments']])$(id).onsubmit=e=>{e.preventDefault();action(async()=>{const rid=state.editing[id];await api(rid?`${path}/${rid}`:path,rid?'PUT':'POST',{...formData(e.target),portfolio_id:state.pid});cancelEditor(id);await load();toast(rid?'Updated':'Saved')})};
   $('reconForm').onsubmit=e=>{e.preventDefault();action(async()=>{const id=state.editing.reconForm,d=formData(e.target);d.portfolio_id=state.pid;d.apply_now=field(e.target,'apply_now').checked&&!field(e.target,'apply_now').disabled;const result=await api(id?`/reconciliations/${id}`:'/reconciliations',id?'PUT':'POST',d);cancelEditor('reconForm');await load();show('reconcile');toast(result.applied?'Cash set to the reported value':'Balance check saved')})};
   $('portfolioForm').onsubmit=e=>{e.preventDefault();action(async()=>{const name=field(e.target,'name').value;await api(`/portfolios/${state.pid}`,'PUT',{name});const opt=$('portfolioSelect').querySelector(`option[value="${state.pid}"]`);if(opt)opt.textContent=name;await load();toast('Portfolio renamed')})};

@@ -85,9 +85,15 @@ def init_db():
         CREATE TABLE IF NOT EXISTS transaction_audit(id INTEGER PRIMARY KEY, portfolio_id INTEGER NOT NULL,
             transaction_id INTEGER NOT NULL, action TEXT NOT NULL, actor TEXT NOT NULL,
             before_json TEXT, after_json TEXT, changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+        CREATE TABLE IF NOT EXISTS reinvestments(id INTEGER PRIMARY KEY,
+            portfolio_id INTEGER NOT NULL REFERENCES portfolios(id),
+            dividend_transaction_id INTEGER NOT NULL UNIQUE REFERENCES transactions(id),
+            buy_transaction_id INTEGER NOT NULL UNIQUE REFERENCES transactions(id));
         ''')
         if 'fx_rate' not in {column['name'] for column in c.execute('PRAGMA table_info(transactions)')}:
             c.execute('ALTER TABLE transactions ADD COLUMN fx_rate REAL NOT NULL DEFAULT 0')
+        if 'franking_credit' not in {column['name'] for column in c.execute('PRAGMA table_info(transactions)')}:
+            c.execute('ALTER TABLE transactions ADD COLUMN franking_credit REAL NOT NULL DEFAULT 0')
         instrument_columns = {column['name'] for column in c.execute('PRAGMA table_info(instruments)')}
         if 'tv_symbol' not in instrument_columns:
             c.execute("ALTER TABLE instruments ADD COLUMN tv_symbol TEXT NOT NULL DEFAULT ''")
@@ -467,6 +473,7 @@ def validate_transaction(c, d, pid):
     fee = num(d.get('fee') or 0, 'Fee')
     tax = num(d.get('tax') or 0, 'Tax withheld')
     fx_rate = num(d.get('fx_rate') or 0, 'FX rate')
+    franking_credit = num(d.get('franking_credit') or 0, 'Franking credit')
     day = iso_day(d.get('occurred_at'))
     if kind in ('buy', 'sell') and (not instrument or instrument['currency'] != account['currency'] or quantity <= 0 or price <= 0):
         raise ValueError('Buy and sell need a holding, matching currency, quantity and price')
@@ -476,6 +483,8 @@ def validate_transaction(c, d, pid):
         raise ValueError('Enter an amount greater than zero')
     if kind == 'dividend' and not instrument:
         raise ValueError('Choose a holding for the dividend')
+    if franking_credit and (kind != 'dividend' or account['currency'] != 'AUD'):
+        raise ValueError('Franking credits require an AUD dividend')
     if kind in ('transfer', 'fx'):
         if not target or target['id'] == account['id'] or amount <= 0:
             raise ValueError('Choose different source and destination accounts and enter the sent amount')
@@ -489,7 +498,7 @@ def validate_transaction(c, d, pid):
         target = None
     return (pid, account['id'], target['id'] if target else None,
             instrument['id'] if instrument else None, kind, day, quantity, price, amount,
-            target_amount, fee, tax, str(d.get('note', '')).strip()[:500], fx_rate)
+            target_amount, fee, tax, str(d.get('note', '')).strip()[:500], fx_rate, franking_credit)
 
 
 def check_positions(c, pid):
@@ -530,7 +539,7 @@ def create_transaction():
         with db() as c:
             values = validate_transaction(c, request.get_json() or {}, pid)
             cur = c.execute('''INSERT INTO transactions(portfolio_id,account_id,target_account_id,instrument_id,type,
-                occurred_at,quantity,price,amount,target_amount,fee,tax,note,fx_rate) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', values)
+                occurred_at,quantity,price,amount,target_amount,fee,tax,note,fx_rate,franking_credit) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', values)
             check_positions(c, pid)
             audit(c, pid, cur.lastrowid, 'create', after=c.execute('SELECT * FROM transactions WHERE id=?', (cur.lastrowid,)).fetchone())
         return jsonify(ok=True)
@@ -549,9 +558,11 @@ def update_transaction(tid):
                 return problem('Transaction not found', 404)
             if c.execute('SELECT 1 FROM reconciliations WHERE adjustment_transaction_id=?', (tid,)).fetchone():
                 return problem('This cash correction belongs to a balance check. Edit and reconcile the check instead.')
+            if c.execute('SELECT 1 FROM reinvestments WHERE dividend_transaction_id=? OR buy_transaction_id=?', (tid, tid)).fetchone():
+                return problem('This transaction belongs to a dividend reinvestment. Edit the reinvestment together instead.')
             values = validate_transaction(c, request.get_json() or {}, pid)
             c.execute('''UPDATE transactions SET portfolio_id=?,account_id=?,target_account_id=?,instrument_id=?,type=?,
-                occurred_at=?,quantity=?,price=?,amount=?,target_amount=?,fee=?,tax=?,note=?,fx_rate=? WHERE id=?''', values + (tid,))
+                occurred_at=?,quantity=?,price=?,amount=?,target_amount=?,fee=?,tax=?,note=?,fx_rate=?,franking_credit=? WHERE id=?''', values + (tid,))
             check_positions(c, pid)
             audit(c, pid, tid, 'update', before=old, after=c.execute('SELECT * FROM transactions WHERE id=?', (tid,)).fetchone())
         return jsonify(ok=True)
@@ -570,6 +581,8 @@ def delete_transaction(tid):
                 return problem('Transaction not found', 404)
             if c.execute('SELECT 1 FROM reconciliations WHERE adjustment_transaction_id=?', (tid,)).fetchone():
                 return problem('This cash correction belongs to a balance check. Delete that check to remove the correction.')
+            if c.execute('SELECT 1 FROM reinvestments WHERE dividend_transaction_id=? OR buy_transaction_id=?', (tid, tid)).fetchone():
+                return problem('This transaction belongs to a dividend reinvestment. Delete the reinvestment together instead.')
             cur = c.execute('DELETE FROM transactions WHERE id=? AND portfolio_id=?', (tid, pid))
             check_positions(c, pid)
             audit(c, pid, tid, 'delete', before=old)
@@ -965,7 +978,9 @@ def calculate(c, pid):
         else:
             session_move += prior_usd_exposure * (rate - previous_rate)
     session_move = None if missing_session_data or current['value'] is None else session_move
+    from reports import cashflow_returns
     return {'holdings': holdings, 'cash': cash, 'series': series,
+            'returns': cashflow_returns(series),
             'value': current['value'], 'invested': current['invested'],
             'profit': current['value'] - current['invested'] if current['value'] is not None and current['invested'] is not None else None,
             'session_move': session_move, 'stale_holdings': stale_holdings, 'fx_rate': rate,
@@ -978,6 +993,48 @@ def calculate(c, pid):
 def dashboard():
     with db() as c:
         return jsonify(calculate(c, portfolio_id()))
+
+
+@app.get('/api/financial-year')
+@auth()
+def financial_year_report():
+    from reports import financial_year
+    try:
+        end_year = int(request.args.get('end_year', ''))
+        if end_year < 2000 or end_year > local_today().year + 1:
+            raise ValueError()
+    except (ValueError, TypeError):
+        return problem('Choose a valid financial year')
+    with db() as c:
+        return jsonify(financial_year(c, portfolio_id(), end_year))
+
+
+@app.get('/api/financial-year.csv')
+@auth()
+def financial_year_csv():
+    from flask import Response
+    from reports import financial_year
+    try:
+        end_year = int(request.args.get('end_year', ''))
+        if end_year < 2000 or end_year > local_today().year + 1:
+            raise ValueError()
+    except (ValueError, TypeError):
+        return problem('Choose a valid financial year')
+    with db() as c:
+        report = financial_year(c, portfolio_id(), end_year)
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(('kind','day','symbol','account','purchase_date','quantity','proceeds_aud',
+                     'cost_aud','gain_aud','discount_eligible','gross_income_aud',
+                     'tax_withheld_aud','franking_credit_aud'))
+    for s in report['sales']:
+        writer.writerow(('sale',s['sold'],s['symbol'],s['account_name'],s['acquired'],s['quantity'],
+                         s['proceeds_aud'],s['cost_aud'],s['gain_aud'],s['discount_eligible'],'','',''))
+    for t in report['income']:
+        writer.writerow((t['type'],t['day'],t['symbol'],'','','','','','','',
+                         t['gross_aud'],t['withheld_aud'],t['franking_aud']))
+    return Response(output.getvalue(),mimetype='text/csv',headers={
+        'Content-Disposition':f'attachment; filename="portfolio-financial-year-{end_year}.csv"'})
 
 
 @app.get('/api/documents')
@@ -1225,3 +1282,198 @@ def export_transactions():
     writer.writeheader()
     writer.writerows(data)
     return Response(output.getvalue(), mimetype='text/csv', headers={'Content-Disposition': f'attachment; filename="portfolio-{pid}-transactions.csv"'})
+
+
+@app.get('/api/import/template.csv')
+@auth(admin=True)
+def import_template():
+    from flask import Response
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(('date','type','account','symbol','quantity','price','amount','fee','tax',
+                     'franking_credit','target_account','target_amount','fx_rate','note'))
+    return Response(output.getvalue(), mimetype='text/csv', headers={
+        'Content-Disposition': 'attachment; filename="portfolio-import-template.csv"'})
+
+
+def prepare_import(c, pid, blob):
+    from csv_import import canonical, existing_signatures, parse_csv, resolve_row
+    incoming = parse_csv(blob)
+    accounts = {a['id']: a for a in rows(c, 'SELECT * FROM accounts WHERE portfolio_id=?', (pid,))}
+    instruments = {i['id']: i for i in rows(c, 'SELECT * FROM instruments')}
+    existing = existing_signatures(c, pid)
+    preview = []
+    inserts = []
+    for raw in incoming:
+        line = raw['_line']
+        try:
+            d, values = resolve_row(c, raw, pid, accounts, instruments, validate_transaction)
+            signature = canonical(dict(zip(('portfolio_id','account_id','target_account_id','instrument_id',
+                'type','occurred_at','quantity','price','amount','target_amount','fee','tax','note','fx_rate',
+                'franking_credit'), values)))
+            if existing[signature]:
+                existing[signature] -= 1
+                status, detail = 'duplicate', 'Already present in this portfolio'
+            elif d['type'] in ('adjustment_in', 'adjustment_out'):
+                status, detail = 'review', 'Cash correction excluded; restore the original database or enter missing deposits instead'
+            else:
+                status, detail = 'ready', ''
+                inserts.append(values)
+            summary = f"{d['occurred_at']} · {d['type']} · {accounts[d['account_id']]['name']}"
+            if d['instrument_id']:
+                summary += ' · ' + instruments[d['instrument_id']]['symbol']
+        except (ValueError, TypeError) as exc:
+            status, detail = 'error', str(exc)
+            summary = f"Row {line} · {raw.get('type', '?')}"
+        preview.append({'line': line, 'summary': summary, 'status': status, 'detail': detail})
+    return preview, inserts
+
+
+@app.post('/api/import/preview')
+@auth(admin=True)
+def preview_import():
+    from itsdangerous import URLSafeTimedSerializer
+    pid = portfolio_id()
+    upload = request.files.get('file')
+    if not upload or not upload.filename.lower().endswith('.csv'):
+        return problem('Select a CSV file')
+    blob = upload.read()
+    try:
+        with db() as c:
+            preview, inserts = prepare_import(c, pid, blob)
+    except ValueError as exc:
+        return problem(str(exc))
+    token = URLSafeTimedSerializer(app.secret_key, salt='transaction-import').dumps(
+        {'digest': __import__('hashlib').sha256(blob).hexdigest(), 'pid': pid, 'uid': session['user_id']})
+    return jsonify(rows=preview, ready=len(inserts), duplicates=sum(x['status']=='duplicate' for x in preview),
+                   errors=sum(x['status']=='error' for x in preview), token=token)
+
+
+@app.post('/api/import/commit')
+@auth(admin=True)
+def commit_import():
+    from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
+    pid = portfolio_id()
+    upload = request.files.get('file')
+    token = request.form.get('token', '')
+    if not upload or not upload.filename.lower().endswith('.csv'):
+        return problem('Select the previewed CSV file')
+    blob = upload.read()
+    try:
+        signed = URLSafeTimedSerializer(app.secret_key, salt='transaction-import').loads(token, max_age=1800)
+    except (BadSignature, SignatureExpired):
+        return problem('Preview expired; preview the CSV again')
+    if (signed.get('digest') != __import__('hashlib').sha256(blob).hexdigest() or
+            signed.get('pid') != pid or signed.get('uid') != session['user_id']):
+        return problem('File or portfolio changed; preview again')
+    try:
+        with db() as c:
+            preview, inserts = prepare_import(c, pid, blob)
+            if any(x['status']=='error' for x in preview):
+                raise ValueError('Some rows cannot be imported; fix them and preview again')
+            for values in inserts:
+                cur = c.execute('''INSERT INTO transactions(portfolio_id,account_id,target_account_id,instrument_id,type,
+                    occurred_at,quantity,price,amount,target_amount,fee,tax,note,fx_rate,franking_credit)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', values)
+                audit(c, pid, cur.lastrowid, 'import',
+                      after=c.execute('SELECT * FROM transactions WHERE id=?', (cur.lastrowid,)).fetchone())
+            check_positions(c, pid)
+        return jsonify(imported=len(inserts), skipped=len(preview)-len(inserts))
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        return problem(str(exc))
+
+
+@app.get('/api/reinvestments')
+@auth()
+def list_reinvestments():
+    pid = portfolio_id()
+    with db() as c:
+        return jsonify(rows(c, '''SELECT r.id,r.dividend_transaction_id,r.buy_transaction_id,
+            d.occurred_at dividend_day,b.occurred_at buy_day,d.account_id,d.instrument_id,
+            a.name account_name,a.currency,i.symbol,d.amount,d.tax,d.franking_credit,
+            b.quantity,b.price,b.fee,d.note FROM reinvestments r
+            JOIN transactions d ON d.id=r.dividend_transaction_id
+            JOIN transactions b ON b.id=r.buy_transaction_id
+            JOIN accounts a ON a.id=d.account_id JOIN instruments i ON i.id=d.instrument_id
+            WHERE r.portfolio_id=? ORDER BY d.occurred_at DESC,r.id DESC''',(pid,)))
+
+
+def reinvestment_values(c, pid, payload):
+    dividend_day = iso_day(payload.get('dividend_day'))
+    buy_day = iso_day(payload.get('buy_day') or dividend_day)
+    if buy_day < dividend_day:
+        raise ValueError('Share allotment cannot be before the dividend payment date')
+    shared={'account_id':payload.get('account_id'),'instrument_id':payload.get('instrument_id'),
+            'note':str(payload.get('note','')).strip()[:500]}
+    dividend=validate_transaction(c,{**shared,'type':'dividend','occurred_at':dividend_day,
+        'amount':payload.get('amount'),'tax':payload.get('tax'),
+        'franking_credit':payload.get('franking_credit')},pid)
+    if Decimal(str(dividend[8])) < Decimal(str(dividend[11])):
+        raise ValueError('Tax withheld cannot exceed the gross dividend')
+    buy=validate_transaction(c,{**shared,'type':'buy','occurred_at':buy_day,
+        'quantity':payload.get('quantity'),'price':payload.get('price'),
+        'fee':payload.get('fee')},pid)
+    # The income is assessable even when reinvested. Each share allotment is a new cost parcel.
+    return dividend,buy
+
+
+TX_COLUMNS='portfolio_id,account_id,target_account_id,instrument_id,type,occurred_at,quantity,price,amount,target_amount,fee,tax,note,fx_rate,franking_credit'
+TX_SET=','.join(f'{column}=?' for column in TX_COLUMNS.split(','))
+
+
+@app.post('/api/reinvestments')
+@auth(admin=True)
+def add_reinvestment():
+    pid=portfolio_id()
+    try:
+        with db() as c:
+            dividend,buy=reinvestment_values(c,pid,request.get_json() or {})
+            first=c.execute(f'INSERT INTO transactions({TX_COLUMNS}) VALUES({",".join(["?"]*15)})',dividend).lastrowid
+            second=c.execute(f'INSERT INTO transactions({TX_COLUMNS}) VALUES({",".join(["?"]*15)})',buy).lastrowid
+            check_positions(c,pid)
+            rid=c.execute('INSERT INTO reinvestments(portfolio_id,dividend_transaction_id,buy_transaction_id) VALUES(?,?,?)',
+                          (pid,first,second)).lastrowid
+            for tid in (first,second):
+                audit(c,pid,tid,'create',after=c.execute('SELECT * FROM transactions WHERE id=?',(tid,)).fetchone())
+        return jsonify(ok=True,id=rid,dividend_transaction_id=first,buy_transaction_id=second)
+    except (ValueError,sqlite3.IntegrityError) as exc:
+        return problem(str(exc))
+
+
+@app.put('/api/reinvestments/<int:rid>')
+@auth(admin=True)
+def edit_reinvestment(rid):
+    pid=portfolio_id()
+    try:
+        with db() as c:
+            group=c.execute('SELECT * FROM reinvestments WHERE id=? AND portfolio_id=?',(rid,pid)).fetchone()
+            if not group:return problem('Reinvestment not found',404)
+            dividend,buy=reinvestment_values(c,pid,request.get_json() or {})
+            for tid,values in ((group['dividend_transaction_id'],dividend),(group['buy_transaction_id'],buy)):
+                old=c.execute('SELECT * FROM transactions WHERE id=?',(tid,)).fetchone()
+                c.execute(f'UPDATE transactions SET {TX_SET} WHERE id=?',values+(tid,))
+                audit(c,pid,tid,'update',before=old,after=c.execute('SELECT * FROM transactions WHERE id=?',(tid,)).fetchone())
+            check_positions(c,pid)
+        return jsonify(ok=True)
+    except (ValueError,sqlite3.IntegrityError) as exc:
+        return problem(str(exc))
+
+
+@app.delete('/api/reinvestments/<int:rid>')
+@auth(admin=True)
+def delete_reinvestment(rid):
+    pid=portfolio_id()
+    try:
+        with db() as c:
+            group=c.execute('SELECT * FROM reinvestments WHERE id=? AND portfolio_id=?',(rid,pid)).fetchone()
+            if not group:return problem('Reinvestment not found',404)
+            before=[c.execute('SELECT * FROM transactions WHERE id=?',(group[key],)).fetchone()
+                    for key in ('dividend_transaction_id','buy_transaction_id')]
+            c.execute('DELETE FROM reinvestments WHERE id=?',(rid,))
+            for tx in before:
+                c.execute('DELETE FROM transactions WHERE id=?',(tx['id'],))
+                audit(c,pid,tx['id'],'delete',before=tx)
+            check_positions(c,pid)
+        return jsonify(ok=True)
+    except ValueError as exc:
+        return problem(str(exc))
