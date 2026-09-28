@@ -5,7 +5,16 @@ const esc = s => String(s ?? '').replace(/[&<>"']/g, x => ({'&':'&amp;','<':'&lt
 const money = (n,c='AUD') => n == null || !Number.isFinite(Number(n)) ? '—' : new Intl.NumberFormat('en-AU',{style:'currency',currency:c,maximumFractionDigits:2}).format(n);
 const pct = n => n == null ? '—' : `${n>=0?'+':''}${n.toFixed(2)}%`;
 const number = n => Number(n||0).toLocaleString('en-AU',{maximumFractionDigits:6});
-const signClass = n => n == null ? '' : n >= 0 ? 'up' : 'down';
+const signClass = n => n == null ? '' : n > 0 ? 'up' : n < 0 ? 'down' : '';
+function cashMovement(t){
+  const gross=Number(t.quantity||0)*Number(t.price||0),fee=Number(t.fee||0),amount=Number(t.amount||0);
+  if(t.type==='buy')return -gross-fee;
+  if(t.type==='sell')return gross-fee;
+  if(t.type==='split')return null;
+  if(['withdrawal','fee','transfer','fx','adjustment_out'].includes(t.type))return -amount-(['transfer','fx'].includes(t.type)?fee:0);
+  if(t.type==='dividend')return amount-Number(t.tax||0)-fee;
+  return amount;
+}
 const empty = message => `<div class="empty">${esc(message)}</div>`;
 const melbourneDay = () => {const parts=Object.fromEntries(new Intl.DateTimeFormat('en-AU',{timeZone:'Australia/Melbourne',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date()).map(x=>[x.type,x.value]));return `${parts.year}-${parts.month}-${parts.day}`};
 let toastTimer;
@@ -71,14 +80,15 @@ function renderOptions(){
 function renderOverview(){
   const d=state.dashboard;
   $('totalValue').textContent=money(d.value);
+  $('totalValue').className=`big-number ${signClass(d.value)}`;
   $('totalContext').textContent=d.value==null?'Add prices and a USD/AUD rate to complete the valuation':`AUD · investments and cash${d.fx_rate?` · USD/AUD ${number(d.fx_rate)} (${d.fx_day})`:''}`;
   $('profit').textContent=money(d.profit);$('profit').className=signClass(d.profit);
   $('dayChange').textContent=money(d.day_change);$('dayChange').className=signClass(d.day_change);
-  $('holdings').innerHTML=d.holdings.length?d.holdings.map(h=>`<div class="row clickable" data-holding="${h.id}" tabindex="0" role="button"><div class="row-main"><b>${esc(h.symbol)} <span class="pill">${esc(h.exchange)}</span></b><small>${esc(h.name)} · ${number(h.quantity)} shares</small></div><div class="row-side"><b>${money(h.value,h.currency)}</b><small>${money(h.price,h.currency)} / share · <span class="${signClass(h.gain_pct)}">${pct(h.gain_pct)}</span></small></div></div>`).join(''):empty('No holdings yet. Add an account, a holding and a buy transaction in Manage.');
+  $('holdings').innerHTML=d.holdings.length?d.holdings.map(h=>`<div class="row clickable" data-holding="${h.id}" tabindex="0" role="button"><div class="row-main"><b>${esc(h.symbol)} <span class="pill">${esc(h.exchange)}</span></b><small>${esc(h.name)} · ${number(h.quantity)} shares · ${esc(h.brokers.map(b=>b.name).join(', '))}</small></div><div class="row-side"><b class="${signClass(h.value)}">${money(h.value,h.currency)}</b><small>${money(h.price,h.currency)} / share · <span class="${signClass(h.gain_pct)}">${pct(h.gain_pct)}</span></small></div></div>`).join(''):empty('No holdings yet. Add an account, a holding and a buy transaction in Manage.');
   const valued=d.holdings.filter(h=>h.value!=null).map(h=>({...h,aud:h.value*(h.currency==='USD'?(d.fx_rate||0):1)}));
   const total=valued.reduce((s,h)=>s+h.aud,0);
-  $('allocation').innerHTML=valued.length&&total>0?valued.map(h=>`<div class="row"><div class="row-main"><b>${esc(h.symbol)}</b><small>${(h.aud/total*100).toFixed(1)}% of invested holdings</small><div class="bar"><span style="width:${Math.max(1,h.aud/total*100)}%"></span></div></div><div class="row-side">${money(h.aud)}</div></div>`).join(''):empty('Add prices to see allocation.');
-  $('cashSummary').innerHTML=d.cash.length?d.cash.map(a=>`<div class="row"><div class="row-main"><b>${esc(a.name)}</b><small>${esc(a.broker||a.kind)}</small></div><div class="row-side"><b>${money(a.balance,a.currency)}</b></div></div>`).join(''):empty('No cash accounts yet.');
+  $('allocation').innerHTML=valued.length&&total>0?valued.map(h=>`<div class="row"><div class="row-main"><b>${esc(h.symbol)}</b><small>${(h.aud/total*100).toFixed(1)}% of invested holdings</small><div class="bar"><span style="width:${Math.max(1,h.aud/total*100)}%"></span></div></div><div class="row-side ${signClass(h.aud)}">${money(h.aud)}</div></div>`).join(''):empty('Add prices to see allocation.');
+  $('cashSummary').innerHTML=d.cash.length?d.cash.map(a=>`<div class="row"><div class="row-main"><b>${esc(a.name)}</b><small>Cash available · ${esc(a.currency)}</small></div><div class="row-side"><b class="${signClass(a.balance)}">${money(a.balance,a.currency)}</b></div></div>`).join(''):empty('No cash accounts yet.');
   drawChart();
 }
 function drawChart(){
@@ -103,11 +113,11 @@ function drawChart(){
 function renderTransactions(){
   const term=$('txSearch').value.toLowerCase(),type=$('txType').value,account=$('txAccount').value,from=$('txFrom').value,to=$('txTo').value;
   const items=state.tx.filter(t=>(!type||t.type===type)&&(!account||String(t.account_id)===account)&&(!from||t.occurred_at>=from)&&(!to||t.occurred_at<=to)&&(!term||`${t.symbol||''} ${t.account_name} ${t.note} ${t.type}`.toLowerCase().includes(term)));
-  $('txList').innerHTML=items.length?items.map(t=>`<div class="row"><div class="row-main"><b>${esc(t.type.toUpperCase())} ${esc(t.symbol||'')}</b><small>${esc(t.occurred_at)} · ${esc(t.account_name)}${t.target_account_name?' → '+esc(t.target_account_name):''}${t.note?' · '+esc(t.note):''}</small><small>${t.quantity?number(t.quantity)+' × '+money(t.price,t.currency):''}${t.tax?' · tax '+money(t.tax,t.currency):''}${t.fee?' · fee '+money(t.fee,t.currency):''}</small></div><div class="row-side"><b>${money(t.amount||((t.quantity||0)*(t.price||0)),t.currency)}</b>${state.auth.role==='admin'?`<small><button data-edit="${t.id}">Edit</button> <button data-delete="${t.id}">Delete</button></small>`:''}</div></div>`).join(''):empty('No matching transactions.');
+  $('txList').innerHTML=items.length?items.map(t=>`<div class="row"><div class="row-main"><b>${esc(t.type.replaceAll('_',' ').toUpperCase())} ${esc(t.symbol||'')}</b><small>${esc(t.occurred_at)} · ${esc(t.account_name)}${t.target_account_name?' → '+esc(t.target_account_name):''}${t.note?' · '+esc(t.note):''}</small><small>${t.quantity?number(t.quantity)+' × '+money(t.price,t.currency):''}${t.tax?' · tax '+money(t.tax,t.currency):''}${t.fee?' · fee '+money(t.fee,t.currency):''}</small></div><div class="row-side"><b class="${signClass(cashMovement(t))}">${money(cashMovement(t),t.currency)}</b>${state.auth.role==='admin'?state.recon.some(r=>r.adjustment_transaction_id===t.id)?'<small>Managed by its balance check</small>':`<small><button data-edit="${t.id}">Edit</button> <button data-delete="${t.id}">Delete</button></small>`:''}</div></div>`).join(''):empty('No matching transactions.');
 }
 function renderCash(){
   const d=state.dashboard;
-  $('cashAccounts').innerHTML=d.cash.length?d.cash.map(a=>`<div class="row"><div class="row-main"><b>${esc(a.name)}</b><small>${esc(a.broker||'Bank')} · ${esc(a.kind)} · ${esc(a.currency)}</small></div><div class="row-side"><b class="${signClass(a.balance)}">${money(a.balance,a.currency)}</b></div></div>`).join(''):empty('Add your bank and broker cash accounts in Manage.');
+  $('cashAccounts').innerHTML=d.cash.length?d.cash.map(a=>`<div class="row"><div class="row-main"><b>${esc(a.name)}</b><small>${esc(a.broker||'Bank')} · ${esc(a.currency)} · cash only</small></div><div class="row-side"><small>Cash balance</small><b class="${signClass(a.balance)}">${money(a.balance,a.currency)}</b></div></div>`).join(''):empty('Add your bank and broker cash accounts in Manage.');
 }
 function renderDocs(){
   const hid=$('docHolding').value,aid=$('docAccount').value,year=$('docYear').value;
@@ -117,36 +127,39 @@ function renderDocs(){
 function renderRecon(){
   const byAccount=new Map(state.dashboard.cash.map(a=>[a.id,a]));
   $('reconList').innerHTML=state.recon.length?state.recon.map(r=>{
-    const account=byAccount.get(r.account_id),isToday=r.day===melbourneDay(),difference=account?.account_value==null?null:r.reported_value-account.account_value;
-    const match=state.auth.role==='admin'&&isToday&&difference!=null&&Math.abs(difference)>=.005?` <button data-match-recon="${r.id}" class="primary">Match account value</button>`:'';
-    return `<div class="row"><div class="row-main"><b>${esc(r.account_name)} · ${esc(r.day)}</b><small>Broker reported ${money(r.reported_value,r.currency)}${r.note?' · '+esc(r.note):''}</small><small>${isToday?`Dashboard estimate ${money(account?.account_value,r.currency)} · Holdings ${money(account?.holding_value,r.currency)} + cash ${money(account?.balance,r.currency)}`:'Historical comparison needs a dated account snapshot'}</small></div><div class="row-side">${isToday&&difference!=null?`Difference ${money(difference,r.currency)}`:''}${match}${state.auth.role==='admin'?` <button data-edit-recon="${r.id}">Edit</button> <button data-delete-recon="${r.id}">Delete</button>`:''}</div></div>`
+    const account=byAccount.get(r.account_id),isToday=r.day===melbourneDay();
+    const observed=account?.balance;
+    const difference=observed==null?null:r.reported_value-observed;
+    const match=state.auth.role==='admin'&&isToday&&difference!=null&&Math.abs(difference)>=.005?` <button data-match-recon="${r.id}" class="primary">Set cash to reported</button>`:'';
+    return `<div class="row"><div class="row-main"><b>${esc(r.account_name)} · ${esc(r.day)} · Cash</b><small>Reported <span class="${signClass(r.reported_value)}">${money(r.reported_value,r.currency)}</span>${r.note?' · '+esc(r.note):''}</small><small>${isToday?`Current cash balance <span class="${signClass(observed)}">${money(observed,r.currency)}</span>`:'Historical check · current comparison unavailable'}</small></div><div class="row-side">${isToday&&difference!=null?`<span class="${signClass(difference)}">Difference ${money(difference,r.currency)}</span>`:''}${match}${state.auth.role==='admin'?` <button data-edit-recon="${r.id}">Edit</button> <button data-delete-recon="${r.id}">Delete</button>`:''}</div></div>`
   }).join(''):empty('No balance checks yet. Add a current broker balance in Manage.');
 }
 function renderManage(){
   if(state.auth.role!=='admin')return;
-  const record=(title,sub,buttons)=>`<div class="row"><div class="row-main"><b>${esc(title)}</b><small>${esc(sub)}</small></div><div class="row-side">${buttons}</div></div>`;
+  const record=(title,sub,buttons,value=null)=>`<div class="row"><div class="row-main"><b class="${signClass(value)}">${esc(title)}</b><small>${esc(sub)}</small></div><div class="row-side">${buttons}</div></div>`;
   const editDelete=(kind,id)=>`<button data-edit-${kind}="${id}">Edit</button><button class="danger" data-delete-${kind}="${id}">Delete</button>`;
   const trade=state.tx.filter(t=>['buy','sell','split'].includes(t.type)).slice(0,6);
   const cash=state.tx.filter(t=>!['buy','sell','split'].includes(t.type)).slice(0,6);
   $('recentTrades').innerHTML=trade.length?trade.map(t=>record(`${t.type.toUpperCase()} ${t.symbol||''}`,`${t.occurred_at} · ${t.account_name} · ${number(t.quantity)} shares`,editDelete('tx',t.id))).join(''):empty('No trades yet.');
-  $('recentCash').innerHTML=cash.length?cash.map(t=>record(`${t.type.toUpperCase()} · ${money(t.amount,t.currency)}`,`${t.occurred_at} · ${t.account_name}`,editDelete('tx',t.id))).join(''):empty('No cash activity yet.');
-  $('accountManageList').innerHTML=state.setup.accounts.length?state.setup.accounts.map(a=>record(a.name,`${a.broker||a.kind} · ${a.currency}`,editDelete('account',a.id))).join(''):empty('No accounts in this portfolio.');
+  $('recentCash').innerHTML=cash.length?cash.map(t=>record(`${t.type.replaceAll('_',' ').toUpperCase()} · ${money(cashMovement(t),t.currency)}`,`${t.occurred_at} · ${t.account_name}`,state.recon.some(r=>r.adjustment_transaction_id===t.id)?'<small>Managed in Balance checks</small>':editDelete('tx',t.id),cashMovement(t))).join(''):empty('No cash activity yet.');
+  $('accountManageList').innerHTML=state.setup.accounts.length?state.setup.accounts.map(a=>{const cash=state.dashboard.cash.find(x=>x.id===a.id)?.balance;return record(`${a.name} · ${money(cash,a.currency)}`,`${a.broker||a.kind} · ${a.currency} · cash available`,editDelete('account',a.id),cash)}).join(''):empty('No accounts in this portfolio.');
   $('instrumentManageList').innerHTML=state.setup.instruments.length?state.setup.instruments.map(i=>record(i.symbol,`${i.name} · ${i.exchange}`,editDelete('instrument',i.id))).join(''):empty('No holdings added.');
-  $('priceManageList').innerHTML=state.prices.length?state.prices.map(p=>record(`${p.symbol} · ${money(p.close,p.currency)}`,`${p.day} · ${p.source}`,`<button data-edit-price="${p.instrument_id}|${p.day}">Edit</button><button class="danger" data-delete-price="${p.instrument_id}|${p.day}">Delete</button>`)).join(''):empty('No prices recorded.');
+  $('priceManageList').innerHTML=state.prices.length?state.prices.map(p=>record(`${p.symbol} · ${money(p.close,p.currency)}`,`${p.day} · ${p.source}`,`<button data-edit-price="${p.instrument_id}|${p.day}">Edit</button><button class="danger" data-delete-price="${p.instrument_id}|${p.day}">Delete</button>`,p.close)).join(''):empty('No prices recorded.');
   $('fxManageList').innerHTML=state.fx.length?state.fx.map(x=>record(`${number(x.usd_aud)} AUD / USD`,`${x.day} · ${x.source}`,`<button data-edit-fx="${x.day}">Edit</button><button class="danger" data-delete-fx="${x.day}">Delete</button>`)).join(''):empty('No exchange rates recorded.');
   $('manageDocs').innerHTML=state.docs.length?state.docs.map(d=>record(d.title,[d.symbol,d.account_name,d.tax_year].filter(Boolean).join(' · '),`<a href="/api/documents/${d.id}/file" target="_blank" rel="noopener">Open</a> ${editDelete('doc',d.id)}`)).join(''):empty('No documents yet.');
-  $('manageChecks').innerHTML=state.recon.length?state.recon.map(r=>record(r.account_name,`${r.day} · ${money(r.reported_value,r.currency)}`,editDelete('recon',r.id))).join(''):empty('No balance checks yet.');
+  $('manageChecks').innerHTML=state.recon.length?state.recon.map(r=>record(r.account_name,`${r.day} · cash ${money(r.reported_value,r.currency)}`,editDelete('recon',r.id),r.reported_value)).join(''):empty('No balance checks yet.');
 }
 function renderDetail(){
   const h=state.dashboard.holdings.find(x=>x.id===state.selectedHolding);
   if(!h){show('overview');return}
   const tx=state.tx.filter(t=>t.instrument_id===h.id),docs=state.docs.filter(d=>d.instrument_id===h.id);
   const priceRows=h.prices.slice(-60).reverse();
-  $('detailContent').innerHTML=`<div class="card"><div class="detail-head"><div><span class="pill">${esc(h.exchange)} · ${esc(h.currency)}</span><h2>${esc(h.symbol)}</h2><span class="muted">${esc(h.name)}</span></div><div class="row-side"><strong>${money(h.price,h.currency)}</strong><small>As of ${esc(h.price_day||'no price')} · ${esc(h.price_source||'')}</small></div></div><div class="detail-grid"><div class="metric"><small>Current value</small><strong>${money(h.value,h.currency)}</strong></div><div class="metric"><small>Shares</small><strong>${number(h.quantity)}</strong></div><div class="metric"><small>Average cost</small><strong>${money(h.avg_cost,h.currency)}</strong></div><div class="metric"><small>Unrealised gain</small><strong class="${signClass(h.gain)}">${money(h.gain,h.currency)} · ${pct(h.gain_pct)}</strong></div></div><p class="muted fine">Average cost uses a pooled cost basis. Realised gain on sales: ${money(h.realized,h.currency)}. Tax reporting may use different rules.</p></div>
+  $('detailContent').innerHTML=`<div class="card"><div class="detail-head"><div><span class="pill">${esc(h.exchange)} · ${esc(h.currency)}</span><h2>${esc(h.symbol)}</h2><span class="muted">${esc(h.name)}</span></div><div class="row-side"><strong class="${signClass(h.price)}">${money(h.price,h.currency)}</strong><small>As of ${esc(h.price_day||'no price')} · ${esc(h.price_source||'')}</small></div></div><div class="detail-grid"><div class="metric"><small>Current value</small><strong class="${signClass(h.value)}">${money(h.value,h.currency)}</strong></div><div class="metric"><small>Shares</small><strong>${number(h.quantity)}</strong></div><div class="metric"><small>Average cost</small><strong>${money(h.avg_cost,h.currency)}</strong></div><div class="metric"><small>Unrealised gain</small><strong class="${signClass(h.gain)}">${money(h.gain,h.currency)} · ${pct(h.gain_pct)}</strong></div></div><p class="muted fine">Average cost uses a pooled cost basis. Realised gain on sales: <span class="${signClass(h.realized)}">${money(h.realized,h.currency)}</span>. Tax reporting may use different rules.</p></div>
+  <div class="card"><h2>Held through broker</h2>${h.brokers.map(b=>`<div class="row"><b>${esc(b.name)}</b><span>${number(b.quantity)} shares</span></div>`).join('')}</div>
   <div class="card chart-card"><h2>Price history</h2><canvas id="detailChart" height="200" aria-label="Holding price history chart"></canvas><p class="muted fine">Daily closing prices in ${esc(h.currency)}. Missing dates have no price.</p></div>
-  <div class="two-col"><div class="card"><h2>Transactions</h2>${tx.length?tx.map(t=>`<div class="row"><div class="row-main"><b>${esc(t.type)} · ${esc(t.occurred_at)}</b><small>${esc(t.account_name)} · ${number(t.quantity)} shares</small></div><div class="row-side">${money(t.amount||t.quantity*t.price,t.currency)}</div></div>`).join(''):empty('No transactions.')}</div>
+  <div class="two-col"><div class="card"><h2>Transactions</h2>${tx.length?tx.map(t=>`<div class="row"><div class="row-main"><b>${esc(t.type)} · ${esc(t.occurred_at)}</b><small>${esc(t.account_name)} · ${number(t.quantity)} shares</small></div><div class="row-side ${signClass(cashMovement(t))}">${money(cashMovement(t),t.currency)}</div></div>`).join(''):empty('No transactions.')}</div>
   <div class="card"><h2>Documents</h2>${docs.length?docs.map(d=>`<div class="row"><div class="row-main"><b>${esc(d.title)}</b><small>${esc(d.tax_year||d.original_name)}</small></div><a href="/api/documents/${d.id}/file" target="_blank" rel="noopener">Open</a></div>`).join(''):empty('No documents attached to this holding.')}</div></div>
-  <div class="card"><h2>Recent price history</h2>${priceRows.length?priceRows.map(p=>`<div class="row"><span>${esc(p.day)} <small class="muted">${esc(p.source)}</small></span><b>${money(p.close,h.currency)}</b></div>`).join(''):empty('Add prices manually or connect a delayed price feed.')}</div>`;
+  <div class="card"><h2>Recent price history</h2>${priceRows.length?priceRows.map(p=>`<div class="row"><span>${esc(p.day)} <small class="muted">${esc(p.source)}</small></span><b class="${signClass(p.close)}">${money(p.close,h.currency)}</b></div>`).join(''):empty('Add prices manually or connect a delayed price feed.')}</div>`;
   requestAnimationFrame(()=>drawDetailChart(h));
 }
 function drawDetailChart(h){
@@ -174,7 +187,12 @@ function editTransaction(id){
 }
 async function action(fn){try{await fn()}catch(e){toast(e.message,true)}}
 function populate(form,data){for(const [key,value] of Object.entries(data)){const el=field(form,key);if(el)el.value=value??''}}
-function resetForm(form){form.reset();form.querySelectorAll('input[type="date"]').forEach(el=>el.value=new Date().toLocaleDateString('en-CA'));form.querySelector('details')?.removeAttribute('open')}
+function resetForm(form){form.reset();form.querySelectorAll('input[type="date"]').forEach(el=>el.value=melbourneDay());form.querySelector('details')?.removeAttribute('open')}
+function updateReconFields(){
+  const today=field($('reconForm'),'day').value===melbourneDay(),checkbox=field($('reconForm'),'apply_now');
+  checkbox.disabled=!today;if(!today)checkbox.checked=false;
+  $('reconHelp').textContent=today?'This sets only cash in the chosen account. Shares remain in Holdings. A matched correction appears in Transactions and affects profit.':'Historical checks are saved for reference; only a check dated today can change the current cash balance.';
+}
 function cancelEditor(id){
   const form=$(id);delete state.editing[id];resetForm(form);
   const title={txForm:'Record a trade',cashForm:'Record cash activity',accountForm:'Add account',instrumentForm:'Add holding',reconForm:'Add balance check'};
@@ -182,6 +200,7 @@ function cancelEditor(id){
   const cancel=form.querySelector('[data-cancel],#cancelEdit,#cancelCashEdit');if(cancel)cancel.hidden=true;
   if(id==='docMetaForm')form.hidden=true;
   updateTypeFields();
+  if(id==='reconForm')updateReconFields();
 }
 function updateTypeFields(){
   const trade=$('editType').value,kind=$('cashType').value;
@@ -205,10 +224,10 @@ function editDocument(id){
   showManage('files');const form=$('docMetaForm');form.hidden=false;state.editing.docMetaForm=id;
   populate(form,d);form.scrollIntoView({behavior:'smooth',block:'start'});
 }
-function editRecon(id){const r=state.recon.find(x=>x.id===id);if(r)startEdit('reconForm',r,'reconFormTitle','Edit balance check','checks')}
+function editRecon(id){const r=state.recon.find(x=>x.id===id);if(r){startEdit('reconForm',r,'reconFormTitle','Edit balance check','checks');field($('reconForm'),'apply_now').checked=r.day===melbourneDay();updateReconFields()}}
 async function deleteRecord(kind,id){
   const urls={tx:`/transactions/${id}`,account:`/accounts/${id}`,instrument:`/instruments/${id}`,doc:`/documents/${id}`,recon:`/reconciliations/${id}`};
-  if(!confirm(`Delete this ${({tx:'transaction',instrument:'holding',doc:'document',recon:'balance check'})[kind]||kind}?${kind==='instrument'?' Its price history will also be removed.':''}`))return;
+  if(!confirm(`Delete this ${({tx:'transaction',instrument:'holding',doc:'document',recon:'balance check'})[kind]||kind}?${kind==='instrument'?' Its price history will also be removed.':''}${kind==='recon'?' Any cash correction made by this check will be removed.':''}`))return;
   await api(kind==='tx'||kind==='account'||kind==='doc'||kind==='recon'?query(urls[kind]):urls[kind],'DELETE');
   await load();toast('Deleted');
 }
@@ -231,10 +250,11 @@ function bind(){
     const edit=e.target.closest('[data-edit-recon]'),del=e.target.closest('[data-delete-recon]'),match=e.target.closest('[data-match-recon]');
     if(edit)editRecon(Number(edit.dataset.editRecon));if(del)await deleteRecord('recon',del.dataset.deleteRecon);
     if(match){const r=state.recon.find(x=>x.id===Number(match.dataset.matchRecon)),a=state.dashboard.cash.find(x=>x.id===r?.account_id);
-      if(!r||!a||a.account_value==null)return;
-      const delta=r.reported_value-a.account_value;
-      if(confirm(`Match ${r.account_name} to ${money(r.reported_value,r.currency)}?\n\nThe dashboard currently shows ${money(a.account_value,r.currency)} (${money(a.holding_value,r.currency)} holdings + ${money(a.balance,r.currency)} cash). This will ${delta>=0?'add':'remove'} ${money(Math.abs(delta),r.currency)} of cash as a balance correction. It will appear in Transactions and affect reported profit. Check your transactions and prices first.`)){
-        const result=await api(query(`/reconciliations/${r.id}/match`),'POST',{portfolio_id:state.pid,expected_account_value:a.account_value});await load();toast(result.amount?'Cash balance corrected':'Account already matches');
+      if(!r||!a)return;
+      const observed=a.balance;if(observed==null)return;
+      const delta=r.reported_value-observed;
+      if(confirm(`Set ${r.account_name} cash to ${money(r.reported_value,r.currency)}?\n\nCurrent cash: ${money(observed,r.currency)}. This will ${delta>=0?'add':'remove'} ${money(Math.abs(delta),r.currency)} of cash. Shares stay separate. The correction appears in Transactions and changes reported profit.`)){
+        const result=await api(query(`/reconciliations/${r.id}/match`),'POST',{portfolio_id:state.pid,expected_cash_balance:observed});await load();toast(result.amount?'Cash now matches the check':'Cash already matches');
       }
     }
   });
@@ -243,6 +263,7 @@ function bind(){
   document.querySelectorAll('[data-cancel]').forEach(b=>b.onclick=()=>cancelEditor(b.dataset.cancel));
   $('cancelEdit').onclick=()=>cancelEditor('txForm');$('cancelCashEdit').onclick=()=>cancelEditor('cashForm');
   $('editType').onchange=updateTypeFields;$('cashType').onchange=updateTypeFields;field($('cashForm'),'account_id').onchange=updateTypeFields;
+  field($('reconForm'),'day').onchange=updateReconFields;
   $('admin').onclick=e=>action(async()=>{
     const b=e.target.closest('button[data-edit-tx],button[data-delete-tx],button[data-edit-account],button[data-delete-account],button[data-edit-instrument],button[data-delete-instrument],button[data-edit-price],button[data-delete-price],button[data-edit-fx],button[data-delete-fx],button[data-edit-doc],button[data-delete-doc],button[data-edit-recon],button[data-delete-recon]');
     if(!b)return;
@@ -263,7 +284,8 @@ function bind(){
   });
   $('txForm').onsubmit=e=>{e.preventDefault();action(async()=>{const form=e.target,d=formData(form),id=state.editing.txForm;d.portfolio_id=state.pid;d.amount=0;d.target_amount=0;d.tax=0;d.target_account_id='';d.fx_rate=0;if(d.type==='split'){d.price=0;d.fee=0}await api(id?`/transactions/${id}`:'/transactions',id?'PUT':'POST',d);cancelEditor('txForm');await load();toast(id?'Trade updated':'Trade saved')})};
   $('cashForm').onsubmit=e=>{e.preventDefault();action(async()=>{const form=e.target,d=formData(form),id=state.editing.cashForm;d.portfolio_id=state.pid;d.quantity=0;d.price=0;if(d.type!=='dividend'){d.instrument_id='';d.tax=0}if(!['transfer','fx'].includes(d.type)){d.target_account_id='';d.target_amount=0;d.fee=0}if(d.type!=='fx')d.target_amount=0;if(!['deposit','withdrawal'].includes(d.type))d.fx_rate=0;await api(id?`/transactions/${id}`:'/transactions',id?'PUT':'POST',d);cancelEditor('cashForm');await load();toast(id?'Activity updated':'Activity saved')})};
-  for(const [id,path] of [['accountForm','/accounts'],['instrumentForm','/instruments'],['reconForm','/reconciliations']])$(id).onsubmit=e=>{e.preventDefault();action(async()=>{const rid=state.editing[id];await api(rid?`${path}/${rid}`:path,rid?'PUT':'POST',{...formData(e.target),portfolio_id:state.pid});cancelEditor(id);await load();toast(rid?'Updated':'Saved')})};
+  for(const [id,path] of [['accountForm','/accounts'],['instrumentForm','/instruments']])$(id).onsubmit=e=>{e.preventDefault();action(async()=>{const rid=state.editing[id];await api(rid?`${path}/${rid}`:path,rid?'PUT':'POST',{...formData(e.target),portfolio_id:state.pid});cancelEditor(id);await load();toast(rid?'Updated':'Saved')})};
+  $('reconForm').onsubmit=e=>{e.preventDefault();action(async()=>{const id=state.editing.reconForm,d=formData(e.target);d.portfolio_id=state.pid;d.apply_now=field(e.target,'apply_now').checked&&!field(e.target,'apply_now').disabled;const result=await api(id?`/reconciliations/${id}`:'/reconciliations',id?'PUT':'POST',d);cancelEditor('reconForm');await load();show('reconcile');toast(result.applied?'Cash set to the reported value':'Balance check saved')})};
   $('portfolioForm').onsubmit=e=>{e.preventDefault();action(async()=>{const name=field(e.target,'name').value;await api(`/portfolios/${state.pid}`,'PUT',{name});const opt=$('portfolioSelect').querySelector(`option[value="${state.pid}"]`);if(opt)opt.textContent=name;await load();toast('Portfolio renamed')})};
   for(const [id,path] of [['priceForm','/prices'],['fxForm','/fx-rate']])$(id).onsubmit=e=>{e.preventDefault();action(()=>saveForm(e.target,path))};
   $('documentForm').onsubmit=e=>{e.preventDefault();action(async()=>{const data=new FormData(e.target);data.set('portfolio_id',state.pid);await api('/documents','POST',data);e.target.reset();await load();toast('Document uploaded')})};
@@ -283,8 +305,8 @@ async function enter(){
   $('portfolioSelect').innerHTML=setup.portfolios.map(p=>`<option value="${p.id}">${esc(p.name)}</option>`).join('');
   $('portfolioSelect').value=state.pid;
   $('txType').innerHTML='<option value="">All types</option>'+types.map(t=>`<option value="${t}">${t.toUpperCase()}</option>`).join('');
-  const day=new Date().toLocaleDateString('en-CA');
+  const day=melbourneDay();
   document.querySelectorAll('form input[type="date"]').forEach(el=>el.value=day);
-  updateTypeFields();await load();show('overview');
+  updateTypeFields();updateReconFields();await load();show('overview');
 }
 bind();api('/auth').then(async a=>{if(a.authenticated){state.auth=a;await enter()}else if(!a.configured)$('loginError').textContent='Set account passwords in .env before signing in.'}).catch(e=>toast(e.message,true));

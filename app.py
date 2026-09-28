@@ -82,6 +82,15 @@ def init_db():
         ''')
         if 'fx_rate' not in {column['name'] for column in c.execute('PRAGMA table_info(transactions)')}:
             c.execute('ALTER TABLE transactions ADD COLUMN fx_rate REAL NOT NULL DEFAULT 0')
+        recon_columns = {column['name'] for column in c.execute('PRAGMA table_info(reconciliations)')}
+        if 'balance_scope' not in recon_columns:
+            c.execute("ALTER TABLE reconciliations ADD COLUMN balance_scope TEXT NOT NULL DEFAULT 'cash'")
+        if 'adjustment_transaction_id' not in recon_columns:
+            c.execute('ALTER TABLE reconciliations ADD COLUMN adjustment_transaction_id INTEGER REFERENCES transactions(id) ON DELETE SET NULL')
+        # Older versions treated broker cash accounts as cash plus holdings.
+        # The account is cash only; retain the reported figure and linked adjustment
+        # so the owner can review and rematch an existing check to cash.
+        c.execute("UPDATE reconciliations SET balance_scope='cash' WHERE balance_scope!='cash'")
         for pid, label in [(1, os.getenv('ADMIN_USERNAME', 'Adam').title()),
                            (2, os.getenv('VIEWER_USERNAME', 'Brother').title())]:
             c.execute('INSERT OR IGNORE INTO portfolios(id,name) VALUES(?,?)', (pid, label))
@@ -478,6 +487,8 @@ def update_transaction(tid):
             old = get_owned(c, 'transactions', tid, pid)
             if not old:
                 return problem('Transaction not found', 404)
+            if c.execute('SELECT 1 FROM reconciliations WHERE adjustment_transaction_id=?', (tid,)).fetchone():
+                return problem('This cash correction belongs to a balance check. Edit and reconcile the check instead.')
             values = validate_transaction(c, request.get_json() or {}, pid)
             c.execute('''UPDATE transactions SET portfolio_id=?,account_id=?,target_account_id=?,instrument_id=?,type=?,
                 occurred_at=?,quantity=?,price=?,amount=?,target_amount=?,fee=?,tax=?,note=?,fx_rate=? WHERE id=?''', values + (tid,))
@@ -497,6 +508,8 @@ def delete_transaction(tid):
             old = get_owned(c, 'transactions', tid, pid)
             if not old:
                 return problem('Transaction not found', 404)
+            if c.execute('SELECT 1 FROM reconciliations WHERE adjustment_transaction_id=?', (tid,)).fetchone():
+                return problem('This cash correction belongs to a balance check. Delete that check to remove the correction.')
             cur = c.execute('DELETE FROM transactions WHERE id=? AND portfolio_id=?', (tid, pid))
             check_positions(c, pid)
             audit(c, pid, tid, 'delete', before=old)
@@ -774,13 +787,20 @@ def calculate(c, pid):
         invested = None if missing_contribution_fx else contributed_aud
         series.append({'day': day, 'value': total, 'invested': invested, 'unpriced': unpriced})
     holdings = []
+    account_by_id = {a['id']: a for a in accounts}
     for iid, qty in shares.items():
         if qty <= 0.00000001:
             continue
         inst = instruments[iid]
         quote = latest_quotes.get(iid)
         value = qty * quote['close'] if quote else None
+        brokers = {}
+        for (aid, holding_id), held in account_shares.items():
+            if holding_id == iid and held > .00000001:
+                label = account_by_id[aid]['broker'].strip() or account_by_id[aid]['name']
+                brokers[label] = brokers.get(label, 0) + held
         holdings.append({**inst, 'quantity': qty, 'cost': costs.get(iid, 0),
+                         'brokers': [{'name': name, 'quantity': held} for name, held in sorted(brokers.items())],
                          'avg_cost': costs.get(iid, 0) / qty if qty else 0,
                          'price': quote['close'] if quote else None,
                          'price_day': quote['day'] if quote else None,
@@ -791,18 +811,6 @@ def calculate(c, pid):
                          'prices': price_history.get(iid, [])})
     holdings.sort(key=lambda h: (h['value'] or 0) * (rate if h['currency'] == 'USD' and rate else 1), reverse=True)
     cash = [{**a, 'balance': current_cash[a['id']]} for a in accounts]
-    for a in cash:
-        a['holding_value'] = 0.0
-        a['unpriced'] = False
-        for (aid, iid), quantity in account_shares.items():
-            if aid != a['id'] or quantity <= 0.00000001:
-                continue
-            quote = latest_quotes.get(iid)
-            if quote:
-                a['holding_value'] += quantity * quote['close']
-            else:
-                a['unpriced'] = True
-        a['account_value'] = None if a['unpriced'] else a['balance'] + a['holding_value']
     current = series[-1]
     prev = series[-2] if len(series) > 1 else None
     day_change = (current['value'] - prev['value'] - (current['invested'] - prev['invested'])
@@ -935,12 +943,16 @@ def add_reconciliation():
     try:
         day = iso_day(d.get('day'))
         reported = num(d.get('reported_value'), 'Reported balance')
+        apply_now = d.get('apply_now') is True
+        if apply_now and day != local_today().isoformat():
+            return problem('Only a check dated today can set the current balance')
         with db() as c:
             if not get_owned(c, 'accounts', d.get('account_id'), pid):
                 return problem('Account not found')
-            c.execute('INSERT INTO reconciliations(portfolio_id,account_id,day,reported_value,note) VALUES(?,?,?,?,?)',
-                      (pid, d['account_id'], day, reported, str(d.get('note', ''))[:300]))
-        return jsonify(ok=True)
+            cur = c.execute("INSERT INTO reconciliations(portfolio_id,account_id,day,reported_value,note,balance_scope) VALUES(?,?,?,?,?,'cash')",
+                            (pid, d['account_id'], day, reported, str(d.get('note', ''))[:300]))
+            delta = match_balance(c, c.execute('SELECT * FROM reconciliations WHERE id=?', (cur.lastrowid,)).fetchone(), pid) if apply_now else None
+        return jsonify(ok=True, applied=apply_now, cash_change=delta)
     except ValueError as e:
         return problem(str(e))
 
@@ -952,14 +964,66 @@ def edit_reconciliation(rid):
     try:
         day = iso_day(d.get('day'))
         reported = num(d.get('reported_value'), 'Reported balance')
+        apply_now = d.get('apply_now') is True
+        if apply_now and day != local_today().isoformat():
+            return problem('Only a check dated today can set the current balance')
         with db() as c:
-            if not get_owned(c, 'reconciliations', rid, pid) or not get_owned(c, 'accounts', d.get('account_id'), pid):
+            old = get_owned(c, 'reconciliations', rid, pid)
+            if not old or not get_owned(c, 'accounts', d.get('account_id'), pid):
                 abort(404)
-            c.execute('UPDATE reconciliations SET account_id=?,day=?,reported_value=?,note=? WHERE id=? AND portfolio_id=?',
+            if old['adjustment_transaction_id'] and (str(old['account_id']) != str(d['account_id']) or old['day'] != day):
+                remove_check_adjustment(c, old, pid)
+            c.execute("UPDATE reconciliations SET account_id=?,day=?,reported_value=?,note=?,balance_scope='cash' WHERE id=? AND portfolio_id=?",
                       (d['account_id'], day, reported, str(d.get('note', '')).strip()[:300], rid, pid))
-        return jsonify(ok=True)
+            delta = match_balance(c, c.execute('SELECT * FROM reconciliations WHERE id=?', (rid,)).fetchone(), pid) if apply_now else None
+        return jsonify(ok=True, applied=apply_now, cash_change=delta)
     except ValueError as e:
         return problem(str(e))
+
+
+def remove_check_adjustment(c, check, pid):
+    tid = check['adjustment_transaction_id']
+    if tid:
+        old = get_owned(c, 'transactions', tid, pid)
+        c.execute('UPDATE reconciliations SET adjustment_transaction_id=NULL WHERE id=?', (check['id'],))
+        if old:
+            c.execute('DELETE FROM transactions WHERE id=?', (tid,))
+            audit(c, pid, tid, 'delete', before=old)
+
+
+def match_balance(c, check, pid, expected=None):
+    if check['day'] != local_today().isoformat():
+        raise ValueError('Only a check dated today can set the current balance')
+    account = next((a for a in calculate(c, pid)['cash'] if a['id'] == check['account_id']), None)
+    if not account:
+        raise ValueError('Account not found')
+    observed = account['balance']
+    if expected is not None and abs(observed - expected) > .005:
+        raise ValueError('Account value has changed. Reload and review the difference before matching')
+    old = (get_owned(c, 'transactions', check['adjustment_transaction_id'], pid)
+           if check['adjustment_transaction_id'] else None)
+    if old and old['account_id'] != check['account_id']:
+        raise ValueError('Linked cash correction belongs to another account')
+    previous = (old['amount'] if old['type'] == 'adjustment_in' else -old['amount']) if old else 0
+    required = round(check['reported_value'] - (observed - previous), 2)
+    delta = round(required - previous, 2)
+    if abs(required) < .005:
+        if old:
+            remove_check_adjustment(c, check, pid)
+    else:
+        kind = 'adjustment_in' if required > 0 else 'adjustment_out'
+        note = f'Balance check #{check["id"]}: cash balance {check["reported_value"]:.2f}'
+        if old:
+            if old['type'] != kind or abs(old['amount'] - abs(required)) >= .005 or old['note'] != note:
+                c.execute('UPDATE transactions SET type=?,amount=?,note=? WHERE id=?', (kind, abs(required), note, old['id']))
+                audit(c, pid, old['id'], 'update', before=old,
+                      after=c.execute('SELECT * FROM transactions WHERE id=?', (old['id'],)).fetchone())
+        else:
+            cur = c.execute('''INSERT INTO transactions(portfolio_id,account_id,type,occurred_at,amount,note)
+                VALUES(?,?,?,?,?,?)''', (pid, check['account_id'], kind, check['day'], abs(required), note))
+            c.execute('UPDATE reconciliations SET adjustment_transaction_id=? WHERE id=?', (cur.lastrowid, check['id']))
+            audit(c, pid, cur.lastrowid, 'create', after=c.execute('SELECT * FROM transactions WHERE id=?', (cur.lastrowid,)).fetchone())
+    return delta
 
 
 @app.post('/api/reconciliations/<int:rid>/match')
@@ -968,40 +1032,32 @@ def match_reconciliation(rid):
     pid = portfolio_id()
     d = request.get_json() or {}
     try:
-        expected = float(d['expected_account_value'])
+        expected = float(d['expected_cash_balance'])
         if not Decimal(str(expected)).is_finite():
             raise ValueError()
     except (KeyError, ValueError, TypeError, OverflowError):
         return problem('Reload the balance check and try again')
-    with db() as c:
-        check = get_owned(c, 'reconciliations', rid, pid)
-        if not check:
-            abort(404)
-        if check['day'] != local_today().isoformat():
-            return problem('Only a balance check dated today can update cash')
-        account = next((a for a in calculate(c, pid)['cash'] if a['id'] == check['account_id']), None)
-        if not account or account['account_value'] is None:
-            return problem('Add a price for every holding in this account before matching its value')
-        if abs(account['account_value'] - expected) > .005:
-            return problem('Account value has changed. Reload and review the difference before matching', 409)
-        difference = round(check['reported_value'] - account['account_value'], 2)
-        if abs(difference) < .005:
-            return jsonify(ok=True, amount=0)
-        kind = 'adjustment_in' if difference > 0 else 'adjustment_out'
-        note = f'Balance check #{rid}: broker account value {check["reported_value"]:.2f}; cash adjustment'
-        cur = c.execute('''INSERT INTO transactions(portfolio_id,account_id,type,occurred_at,amount,note)
-            VALUES(?,?,?,?,?,?)''', (pid, check['account_id'], kind, check['day'], abs(difference), note))
-        audit(c, pid, cur.lastrowid, 'create', after=c.execute('SELECT * FROM transactions WHERE id=?', (cur.lastrowid,)).fetchone())
-    return jsonify(ok=True, amount=difference)
+    try:
+        with db() as c:
+            check = get_owned(c, 'reconciliations', rid, pid)
+            if not check:
+                abort(404)
+            delta = match_balance(c, check, pid, expected)
+        return jsonify(ok=True, amount=delta)
+    except ValueError as e:
+        return problem(str(e), 409)
 
 
 @app.delete('/api/reconciliations/<int:rid>')
 @auth(admin=True)
 def delete_reconciliation(rid):
     with db() as c:
-        result = c.execute('DELETE FROM reconciliations WHERE id=? AND portfolio_id=?', (rid, portfolio_id()))
-        if not result.rowcount:
+        pid = portfolio_id()
+        check = get_owned(c, 'reconciliations', rid, pid)
+        if not check:
             abort(404)
+        remove_check_adjustment(c, check, pid)
+        c.execute('DELETE FROM reconciliations WHERE id=? AND portfolio_id=?', (rid, pid))
     return jsonify(ok=True)
 
 
