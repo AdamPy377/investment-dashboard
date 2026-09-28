@@ -1,5 +1,5 @@
 const $ = id => document.getElementById(id);
-const state = { auth:null, pid:null, setup:null, dashboard:null, tx:[], docs:[], recon:[], prices:[], fx:[], page:'overview', manage:'trades', range:'30', editing:{}, selectedHolding:null };
+const state = { auth:null, pid:null, setup:null, dashboard:null, tx:[], docs:[], recon:[], prices:[], fx:[], page:'overview', manage:'trades', range:'30', chartMode:'value', showAllPrices:false, editing:{}, selectedHolding:null };
 const types = ['buy','sell','deposit','withdrawal','dividend','interest','fee','transfer','fx','split','adjustment_in','adjustment_out'];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, x => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[x]));
 const money = (n,c='AUD') => n == null || !Number.isFinite(Number(n)) ? '—' : new Intl.NumberFormat('en-AU',{style:'currency',currency:c,maximumFractionDigits:2}).format(n);
@@ -108,16 +108,19 @@ function drawChart(){
   const ctx=canvas.getContext('2d');ctx.scale(scale,scale);
   const w=rect.width,h=rect.height, series=state.dashboard.series;
   const start=state.range==='all'?0:Math.max(0,series.length-Number(state.range));
-  const points=series.slice(start), valid=points.flatMap(x=>[x.value,x.invested]).filter(x=>x!=null&&isFinite(x));
+  const points=series.slice(start);
+  const measure=p=>p.value==null||state.chartMode==='profit'&&p.invested==null?null:state.chartMode==='profit'?p.value-p.invested:p.value;
+  const valid=points.map(measure).filter(x=>x!=null&&isFinite(x));
   if(!valid.length){ctx.fillStyle='#99aabf';ctx.font='14px sans-serif';ctx.fillText('Add dated prices and exchange rates to draw the chart',15,h/2);return}
   let min=Math.min(...valid),max=Math.max(...valid);if(min===max){min-=1;max+=1}
   const left=55,right=12,top=14,bottom=25,x=i=>left+(points.length<=1?0:i/(points.length-1))*(w-left-right),y=v=>top+(max-v)/(max-min)*(h-top-bottom);
   ctx.strokeStyle='#31425d';ctx.fillStyle='#95a7c0';ctx.lineWidth=1;ctx.font='11px sans-serif';
   for(let k=0;k<4;k++){const py=top+k*(h-top-bottom)/3;ctx.beginPath();ctx.moveTo(left,py);ctx.lineTo(w-right,py);ctx.stroke();const val=max-k*(max-min)/3;ctx.fillText(val>=1000?`${(val/1000).toFixed(1)}k`:val.toFixed(0),3,py+4)}
-  for(const [key,color] of [['invested','#b6a5eb'],['value','#81e3d7']]){
-    ctx.strokeStyle=color;ctx.lineWidth=2.5;ctx.beginPath();let drawing=false;
-    points.forEach((p,i)=>{if(p[key]==null){drawing=false;return}if(!drawing)ctx.moveTo(x(i),y(p[key]));else ctx.lineTo(x(i),y(p[key]));drawing=true});ctx.stroke();
-  }
+  if(min<0&&max>0){ctx.strokeStyle='#66758e';ctx.setLineDash([4,4]);ctx.beginPath();ctx.moveTo(left,y(0));ctx.lineTo(w-right,y(0));ctx.stroke();ctx.setLineDash([])}
+  ctx.strokeStyle=state.chartMode==='profit'?'#b6a5eb':'#81e3d7';ctx.lineWidth=2.5;ctx.beginPath();let drawing=false;
+  points.forEach((p,i)=>{const v=measure(p);if(v==null){drawing=false;return}if(!drawing)ctx.moveTo(x(i),y(v));else ctx.lineTo(x(i),y(v));drawing=true});ctx.stroke();
+  const hover=state.chartHover;
+  if(hover!=null){const i=Math.max(0,Math.min(points.length-1,Math.round((hover-left)/(w-left-right)*(points.length-1))));const p=points[i];if(p){$('chartReading').textContent=`${p.day} · Value ${money(p.value)} · Net contributions ${money(p.invested)} · Profit ${money(p.value==null||p.invested==null?null:p.value-p.invested)}`;const v=measure(p);if(v!=null){ctx.strokeStyle='#7a8ba5';ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(x(i),top);ctx.lineTo(x(i),h-bottom);ctx.stroke();ctx.fillStyle='#ffffff';ctx.beginPath();ctx.arc(x(i),y(v),4,0,Math.PI*2);ctx.fill()}}}
   ctx.fillStyle='#95a7c0';ctx.fillText(points[0].day,left,h-5);if(points.length>1)ctx.fillText(points.at(-1).day,w-80,h-5);
 }
 function renderTransactions(){
@@ -154,7 +157,12 @@ function renderManage(){
   $('recentCash').innerHTML=cash.length?cash.map(t=>record(`${t.type.replaceAll('_',' ').toUpperCase()} · ${money(cashMovement(t),t.currency)}`,`${t.occurred_at} · ${t.account_name}`,state.recon.some(r=>r.adjustment_transaction_id===t.id)?'<small>Managed in Balance checks</small>':editDelete('tx',t.id),cashMovement(t))).join(''):empty('No cash activity yet.');
   $('accountManageList').innerHTML=state.setup.accounts.length?state.setup.accounts.map(a=>{const cash=state.dashboard.cash.find(x=>x.id===a.id)?.balance;return record(`${a.name} · ${money(cash,a.currency)}`,`${a.broker||a.kind} · ${a.currency} · cash available`,editDelete('account',a.id),cash)}).join(''):empty('No accounts in this portfolio.');
   $('instrumentManageList').innerHTML=state.setup.instruments.length?state.setup.instruments.map(i=>record(i.symbol,`${i.name} · ${i.exchange}`,editDelete('instrument',i.id))).join(''):empty('No holdings added.');
-  $('priceManageList').innerHTML=state.prices.length?state.prices.map(p=>record(`${p.symbol} · ${money(p.close,p.currency)}`,`${p.day} · ${p.source}`,`<button data-edit-price="${p.instrument_id}|${p.day}">Edit</button><button class="danger" data-delete-price="${p.instrument_id}|${p.day}">Delete</button>`,p.close)).join(''):empty('No prices recorded.');
+  const seenPrices=new Set();
+  const latest=state.prices.filter(p=>{if(seenPrices.has(p.instrument_id))return false;seenPrices.add(p.instrument_id);return true});
+  $('togglePriceHistory').hidden=latest.length===state.prices.length;
+  $('togglePriceHistory').textContent=state.showAllPrices?'Show latest only':'Show all prices';
+  const visiblePrices=state.showAllPrices?state.prices:latest;
+  $('priceManageList').innerHTML=visiblePrices.length?visiblePrices.map(p=>record(`${p.symbol} · ${money(p.close,p.currency)}`,`${p.day} · ${p.source}`,`<button data-edit-price="${p.instrument_id}|${p.day}">Edit</button><button class="danger" data-delete-price="${p.instrument_id}|${p.day}">Delete</button>`,p.close)).join(''):empty('No prices recorded.');
   $('fxManageList').innerHTML=state.fx.length?state.fx.map(x=>record(`${number(x.usd_aud)} AUD / USD`,`${x.day} · ${x.source}`,`<button data-edit-fx="${x.day}">Edit</button><button class="danger" data-delete-fx="${x.day}">Delete</button>`)).join(''):empty('No exchange rates recorded.');
   $('manageDocs').innerHTML=state.docs.length?state.docs.map(d=>record(d.title,[d.symbol,d.account_name,d.tax_year].filter(Boolean).join(' · '),`<a href="/api/documents/${d.id}/file" target="_blank" rel="noopener">Open</a> ${editDelete('doc',d.id)}`)).join(''):empty('No documents yet.');
   $('manageChecks').innerHTML=state.recon.length?state.recon.map(r=>record(r.account_name,`${r.day} · cash ${money(r.reported_value,r.currency)}`,editDelete('recon',r.id),r.reported_value)).join(''):empty('No balance checks yet.');
@@ -163,7 +171,7 @@ function renderDetail(){
   const h=state.dashboard.holdings.find(x=>x.id===state.selectedHolding);
   if(!h){show('overview');return}
   const tx=state.tx.filter(t=>t.instrument_id===h.id),docs=state.docs.filter(d=>d.instrument_id===h.id);
-  const priceRows=h.prices.slice(-60).reverse();
+  const priceRows=h.prices.slice(-5).reverse();
   $('detailContent').innerHTML=`<div class="card"><div class="detail-head"><div><span class="pill">${esc(h.exchange)} · ${esc(h.currency)}</span><h2>${esc(h.symbol)}</h2><span class="muted">${esc(h.name)}</span></div><div class="row-side"><strong class="${signClass(h.price)}">${money(h.price,h.currency)}</strong><small>As of ${esc(h.price_day||'no price')} · ${esc(h.price_source||'')}</small></div></div><div class="detail-grid"><div class="metric"><small>Current value</small><strong class="${signClass(h.value)}">${money(h.value,h.currency)}</strong></div><div class="metric"><small>Shares</small><strong>${number(h.quantity)}</strong></div><div class="metric"><small>Average cost</small><strong>${money(h.avg_cost,h.currency)}</strong></div><div class="metric"><small>Unrealised gain</small><strong class="${signClass(h.gain)}">${money(h.gain,h.currency)} · ${pct(h.gain_pct)}</strong></div></div><p class="muted fine">Average cost uses a pooled cost basis. Realised gain on sales: <span class="${signClass(h.realized)}">${money(h.realized,h.currency)}</span>. Tax reporting may use different rules.</p></div>
   <div class="card"><h2>Held through broker</h2>${h.brokers.map(b=>`<div class="row"><b>${esc(b.name)}</b><span>${number(b.quantity)} shares</span></div>`).join('')}</div>
   <div class="card"><h2>Market overview</h2><p class="muted fine">TradingView provides this chart separately. Your portfolio value uses the saved ${esc(h.price_source||"price")} dated ${esc(h.price_day||"not available")}.</p><div id="tradingViewOverview" class="tv-overview"></div></div>
@@ -176,21 +184,20 @@ function renderTradingViewOverview(h){
   const symbol=h.tv_symbol||(h.exchange==='AU'?`ASX:${h.symbol}`:`NASDAQ:${h.symbol}`);
   const target=$('tradingViewOverview');
   if(!/^[A-Z0-9.-]+:[A-Z0-9.-]+$/.test(symbol))return;
-  // The vendor's script runs in an opaque-origin sandbox, away from our session and CSRF token.
-  const config=JSON.stringify({symbols:[[symbol,`${symbol}|1D`]],chartType:'area',lineWidth:2,colorTheme:'dark',backgroundColor:'#151e31',widgetFontColor:'#f3f6fc',fontColor:'#99aabf',gridLineColor:'#30405b',lineType:0,locale:'en',dateRanges:['1d|1','1m|30','3m|60','12m|1D','all|1M'],autosize:true,width:'100%',height:'100%'}).replace(/</g,'\\u003c');
-  const frame=document.createElement('iframe');
-  frame.title=`${symbol} TradingView symbol overview`;
-  frame.setAttribute('sandbox','allow-scripts allow-popups allow-popups-to-escape-sandbox');
-  frame.referrerPolicy='no-referrer';
-  frame.loading='lazy';
-  frame.srcdoc=`<!doctype html><html><head><meta charset="utf-8"><style>html,body{margin:0;height:100%;background:#151e31}.tradingview-widget-container,.tradingview-widget-container__widget{height:100%;width:100%}</style></head><body><div class="tradingview-widget-container"><div class="tradingview-widget-container__widget"></div><script src="https://s3.tradingview.com/external-embedding/embed-widget-symbol-overview.js">${config}<\/script></div></body></html>`;
-  target.append(frame);
+  const container=document.createElement('div');container.className='tradingview-widget-container';
+  const widget=document.createElement('div');widget.className='tradingview-widget-container__widget';container.append(widget);
+  target.append(container);
   const link=document.createElement('a');
   link.className='tv-fallback';
   link.href=`https://www.tradingview.com/symbols/${symbol.replace(':','-')}/`;
   link.target='_blank';link.rel='noopener noreferrer';
   link.textContent=`View ${symbol} on TradingView ↗`;
-  target.append(link);
+  container.append(link);
+  const script=document.createElement('script');script.async=true;
+  script.src='https://s3.tradingview.com/external-embedding/embed-widget-symbol-overview.js';
+  script.textContent=JSON.stringify({symbols:[[h.name,`${symbol}|1D`]],chartType:'area',lineWidth:2,colorTheme:'dark',backgroundColor:'#151e31',widgetFontColor:'#f3f6fc',fontColor:'#99aabf',gridLineColor:'#30405b',lineType:0,locale:'en',dateRanges:['1d|1','1m|30','3m|60','12m|1D','all|1M'],autosize:true,width:'100%',height:'100%'});
+  script.onerror=()=>{widget.textContent='Chart unavailable here. Use the TradingView link below.'};
+  container.append(script);
 }
 function editTransaction(id){
   const t=state.tx.find(t=>t.id===id);if(!t)return;
@@ -259,6 +266,10 @@ function bind(){
   $('holdings').addEventListener('click',e=>{const row=e.target.closest('[data-holding]');if(row){state.selectedHolding=Number(row.dataset.holding);show('holdingDetail');renderDetail()}});
   $('holdings').addEventListener('keydown',e=>{if((e.key==='Enter'||e.key===' ')&&e.target.dataset.holding){e.preventDefault();e.target.click()}});
   $('ranges').onclick=e=>{const b=e.target.closest('[data-range]');if(!b)return;state.range=b.dataset.range;document.querySelectorAll('#ranges button').forEach(x=>x.classList.toggle('active',x===b));drawChart()};
+  $('chartModes').onclick=e=>{const b=e.target.closest('[data-mode]');if(!b)return;state.chartMode=b.dataset.mode;document.querySelectorAll('#chartModes button').forEach(x=>x.classList.toggle('active',x===b));$('chartDescription').textContent=state.chartMode==='profit'?'Portfolio value minus net external contributions, AUD':'Portfolio value in AUD, including cash and deposits';$('chart').setAttribute('aria-label',state.chartMode==='profit'?'Portfolio profit chart':'Portfolio value chart');drawChart()};
+  $('chart').addEventListener('mousemove',e=>{state.chartHover=e.clientX-$('chart').getBoundingClientRect().left;drawChart()});
+  $('chart').addEventListener('mouseleave',()=>{state.chartHover=null;$('chartReading').textContent='Move over the chart to see the date, value and net contributions.';drawChart()});
+  $('togglePriceHistory').onclick=()=>{state.showAllPrices=!state.showAllPrices;renderManage()};
   window.addEventListener('resize',()=>{if(state.dashboard&&state.page==='overview')drawChart();});
   for(const id of ['txSearch','txType','txAccount','txFrom','txTo'])$(id).addEventListener(id==='txSearch'?'input':'change',renderTransactions);
   for(const id of ['docHolding','docAccount','docYear'])$(id).addEventListener('change',renderDocs);
