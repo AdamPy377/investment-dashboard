@@ -1,5 +1,5 @@
 const $ = id => document.getElementById(id);
-const state = { auth:null, pid:null, setup:null, dashboard:null, tx:[], docs:[], recon:[], page:'overview', range:'30', editId:null, selectedHolding:null };
+const state = { auth:null, pid:null, setup:null, dashboard:null, tx:[], docs:[], recon:[], prices:[], fx:[], page:'overview', manage:'trades', range:'30', editing:{}, selectedHolding:null };
 const types = ['buy','sell','deposit','withdrawal','dividend','interest','fee','transfer','fx','split'];
 const esc = s => String(s ?? '').replace(/[&<>"']/g, x => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[x]));
 const money = (n,c='AUD') => n == null || !Number.isFinite(Number(n)) ? '—' : new Intl.NumberFormat('en-AU',{style:'currency',currency:c,maximumFractionDigits:2}).format(n);
@@ -32,26 +32,40 @@ function show(page){
   if(page==='overview'&&state.dashboard)requestAnimationFrame(drawChart);
   window.scrollTo({top:0,behavior:'smooth'});
 }
+function showManage(panel='trades'){
+  state.manage=panel;show('admin');
+  document.querySelectorAll('[data-manage]').forEach(b=>b.classList.toggle('active',b.dataset.manage===panel));
+  document.querySelectorAll('[data-panel]').forEach(el=>el.hidden=el.dataset.panel!==panel);
+}
 async function load(){
-  const [setup,dashboard,tx,docs,recon]=await Promise.all([
-    api(query('/setup')),api(query('/dashboard')),api(query('/transactions')),api(query('/documents')),api(query('/reconciliations'))]);
-  Object.assign(state,{setup,dashboard,tx,docs,recon});
+  const [setup,dashboard,tx,docs,recon,prices,fx]=await Promise.all([
+    api(query('/setup')),api(query('/dashboard')),api(query('/transactions')),api(query('/documents')),api(query('/reconciliations')),
+    state.auth.role==='admin'?api('/prices'):Promise.resolve([]),state.auth.role==='admin'?api('/fx-rates'):Promise.resolve([])]);
+  Object.assign(state,{setup,dashboard,tx,docs,recon,prices,fx});
   $('portfolioName').textContent=setup.portfolios.find(p=>p.id===state.pid)?.name+'’s portfolio';
   const latest=dashboard.holdings.map(h=>h.price_day).filter(Boolean).sort().at(-1);
   $('dataStamp').textContent=latest?`Latest holding price: ${latest}`:'No holding prices yet';
-  renderOptions();renderOverview();renderTransactions();renderCash();renderDocs();renderRecon();
+  renderOptions();renderOverview();renderTransactions();renderCash();renderDocs();renderRecon();renderManage();
   if(state.page==='holdingDetail')renderDetail();
 }
 function renderOptions(){
   const {accounts,instruments}=state.setup;
   for(const id of ['txAccount','docAccount'])options($(id),accounts,a=>`${a.name} · ${a.currency}`,'All accounts');
   options($('docHolding'),instruments,i=>`${i.symbol} · ${i.name}`,'All holdings');
-  for(const name of ['account_id','target_account_id'])options(field($('txForm'),name),accounts,a=>`${a.name} · ${a.currency}`,name==='account_id'?'Choose account':'None');
-  for(const name of ['instrument_id'])for(const form of [$('txForm'),$('documentForm'),$('priceForm')])options(field(form,name),instruments,i=>`${i.symbol} · ${i.name}`,form===$('priceForm')?'Choose holding':'None');
-  for(const form of [$('documentForm'),$('reconForm')])options(field(form,'account_id'),accounts,a=>`${a.name} · ${a.currency}`,form===$('reconForm')?'Choose account':'None');
+  if(state.auth.role==='admin'){
+    for(const form of [$('txForm'),$('cashForm'),$('documentForm'),$('docMetaForm'),$('reconForm')])
+      options(field(form,'account_id'),accounts,a=>`${a.name} · ${a.currency}`,
+              form===$('documentForm')||form===$('docMetaForm')?'None':'Choose account');
+    options(field($('cashForm'),'target_account_id'),accounts,a=>`${a.name} · ${a.currency}`,'Choose destination');
+    for(const form of [$('txForm'),$('cashForm'),$('documentForm'),$('docMetaForm'),$('priceForm')])
+      options(field(form,'instrument_id'),instruments,i=>`${i.symbol} · ${i.name}`,
+              form===$('documentForm')||form===$('docMetaForm')?'None':'Choose holding');
+    field($('portfolioForm'),'name').value=state.setup.portfolios.find(p=>p.id===state.pid)?.name||'';
+  }
   const years=[...new Set(state.docs.map(d=>d.tax_year).filter(Boolean))].sort().reverse();
+  const selectedYear=$('docYear').value;
   $('docYear').innerHTML='<option value="">All tax years</option>'+years.map(y=>`<option>${esc(y)}</option>`).join('');
-  $('txAccount').value='';$('docAccount').value='';$('docHolding').value='';
+  if([...$('docYear').options].some(x=>x.value===selectedYear))$('docYear').value=selectedYear;
 }
 function renderOverview(){
   const d=state.dashboard;
@@ -97,11 +111,26 @@ function renderCash(){
 function renderDocs(){
   const hid=$('docHolding').value,aid=$('docAccount').value,year=$('docYear').value;
   const data=state.docs.filter(d=>(!hid||String(d.instrument_id)===hid)&&(!aid||String(d.account_id)===aid)&&(!year||d.tax_year===year));
-  $('docList').innerHTML=data.length?data.map(d=>`<div class="row"><div class="row-main"><b>${esc(d.title)}</b><small>${esc([d.symbol,d.account_name,d.tax_year,d.original_name].filter(Boolean).join(' · '))}</small></div><div class="row-side"><a href="/api/documents/${d.id}/file" target="_blank" rel="noopener">Open</a>${state.auth.role==='admin'?` <button data-delete-doc="${d.id}">Delete</button>`:''}</div></div>`).join(''):empty('No documents match these filters.');
+  $('docList').innerHTML=data.length?data.map(d=>`<div class="row"><div class="row-main"><b>${esc(d.title)}</b><small>${esc([d.symbol,d.account_name,d.tax_year,d.original_name].filter(Boolean).join(' · '))}</small></div><div class="row-side"><a href="/api/documents/${d.id}/file" target="_blank" rel="noopener">Open</a>${state.auth.role==='admin'?` <button data-edit-doc="${d.id}">Edit</button> <button data-delete-doc="${d.id}">Delete</button>`:''}</div></div>`).join(''):empty('No documents match these filters.');
 }
 function renderRecon(){
   const byAccount=new Map(state.dashboard.cash.map(a=>[a.id,a]));
-  $('reconList').innerHTML=state.recon.length?state.recon.map(r=>{const account=byAccount.get(r.account_id),isToday=r.day===new Date().toLocaleDateString('en-CA'),difference=account?.account_value==null?null:r.reported_value-account.account_value;return `<div class="row"><div class="row-main"><b>${esc(r.account_name)} · ${esc(r.day)}</b><small>Broker reported ${money(r.reported_value,r.currency)}${r.note?' · '+esc(r.note):''}</small><small>${isToday?'Dashboard account estimate '+money(account?.account_value,r.currency):'Historical comparison needs a dated account snapshot'}</small></div><div class="row-side">${isToday&&difference!=null?`Difference ${money(difference,r.currency)}`:''}</div></div>`}).join(''):empty('No balance checks yet. Add a current broker balance in Manage.');
+  $('reconList').innerHTML=state.recon.length?state.recon.map(r=>{const account=byAccount.get(r.account_id),isToday=r.day===new Date().toLocaleDateString('en-CA'),difference=account?.account_value==null?null:r.reported_value-account.account_value;return `<div class="row"><div class="row-main"><b>${esc(r.account_name)} · ${esc(r.day)}</b><small>Broker reported ${money(r.reported_value,r.currency)}${r.note?' · '+esc(r.note):''}</small><small>${isToday?'Dashboard account estimate '+money(account?.account_value,r.currency):'Historical comparison needs a dated account snapshot'}</small></div><div class="row-side">${isToday&&difference!=null?`Difference ${money(difference,r.currency)}`:''}${state.auth.role==='admin'?` <button data-edit-recon="${r.id}">Edit</button> <button data-delete-recon="${r.id}">Delete</button>`:''}</div></div>`}).join(''):empty('No balance checks yet. Add a current broker balance in Manage.');
+}
+function renderManage(){
+  if(state.auth.role!=='admin')return;
+  const record=(title,sub,buttons)=>`<div class="row"><div class="row-main"><b>${esc(title)}</b><small>${esc(sub)}</small></div><div class="row-side">${buttons}</div></div>`;
+  const editDelete=(kind,id)=>`<button data-edit-${kind}="${id}">Edit</button><button class="danger" data-delete-${kind}="${id}">Delete</button>`;
+  const trade=state.tx.filter(t=>['buy','sell','split'].includes(t.type)).slice(0,6);
+  const cash=state.tx.filter(t=>!['buy','sell','split'].includes(t.type)).slice(0,6);
+  $('recentTrades').innerHTML=trade.length?trade.map(t=>record(`${t.type.toUpperCase()} ${t.symbol||''}`,`${t.occurred_at} · ${t.account_name} · ${number(t.quantity)} shares`,editDelete('tx',t.id))).join(''):empty('No trades yet.');
+  $('recentCash').innerHTML=cash.length?cash.map(t=>record(`${t.type.toUpperCase()} · ${money(t.amount,t.currency)}`,`${t.occurred_at} · ${t.account_name}`,editDelete('tx',t.id))).join(''):empty('No cash activity yet.');
+  $('accountManageList').innerHTML=state.setup.accounts.length?state.setup.accounts.map(a=>record(a.name,`${a.broker||a.kind} · ${a.currency}`,editDelete('account',a.id))).join(''):empty('No accounts in this portfolio.');
+  $('instrumentManageList').innerHTML=state.setup.instruments.length?state.setup.instruments.map(i=>record(i.symbol,`${i.name} · ${i.exchange}`,editDelete('instrument',i.id))).join(''):empty('No holdings added.');
+  $('priceManageList').innerHTML=state.prices.length?state.prices.map(p=>record(`${p.symbol} · ${money(p.close,p.currency)}`,`${p.day} · ${p.source}`,`<button data-edit-price="${p.instrument_id}|${p.day}">Edit</button><button class="danger" data-delete-price="${p.instrument_id}|${p.day}">Delete</button>`)).join(''):empty('No prices recorded.');
+  $('fxManageList').innerHTML=state.fx.length?state.fx.map(x=>record(`${number(x.usd_aud)} AUD / USD`,`${x.day} · ${x.source}`,`<button data-edit-fx="${x.day}">Edit</button><button class="danger" data-delete-fx="${x.day}">Delete</button>`)).join(''):empty('No exchange rates recorded.');
+  $('manageDocs').innerHTML=state.docs.length?state.docs.map(d=>record(d.title,[d.symbol,d.account_name,d.tax_year].filter(Boolean).join(' · '),`<a href="/api/documents/${d.id}/file" target="_blank" rel="noopener">Open</a> ${editDelete('doc',d.id)}`)).join(''):empty('No documents yet.');
+  $('manageChecks').innerHTML=state.recon.length?state.recon.map(r=>record(r.account_name,`${r.day} · ${money(r.reported_value,r.currency)}`,editDelete('recon',r.id))).join(''):empty('No balance checks yet.');
 }
 function renderDetail(){
   const h=state.dashboard.holdings.find(x=>x.id===state.selectedHolding);
@@ -130,20 +159,57 @@ function drawDetailChart(h){
 }
 function editTransaction(id){
   const t=state.tx.find(t=>t.id===id);if(!t)return;
-  show('admin');state.editId=id;$('txFormTitle').textContent='Edit transaction';$('cancelEdit').hidden=false;
-  for(const [key,value] of Object.entries(t)){const el=field($('txForm'),key);if(el)el.value=value??''}
-  $('txForm').scrollIntoView({behavior:'smooth'});
+  const isTrade=['buy','sell','split'].includes(t.type),form=$(isTrade?'txForm':'cashForm');
+  showManage(isTrade?'trades':'cash');state.editing[form.id]=id;
+  $(isTrade?'txFormTitle':'cashFormTitle').textContent='Edit '+(isTrade?'trade':'cash activity');
+  $(isTrade?'cancelEdit':'cancelCashEdit').hidden=false;
+  populate(form,t);updateTypeFields();
+  if(t.note)form.querySelector('details')?.setAttribute('open','');
+  form.scrollIntoView({behavior:'smooth',block:'start'});
 }
 async function action(fn){try{await fn()}catch(e){toast(e.message,true)}}
+function populate(form,data){for(const [key,value] of Object.entries(data)){const el=field(form,key);if(el)el.value=value??''}}
+function resetForm(form){form.reset();form.querySelectorAll('input[type="date"]').forEach(el=>el.value=new Date().toLocaleDateString('en-CA'));form.querySelector('details')?.removeAttribute('open')}
+function cancelEditor(id){
+  const form=$(id);delete state.editing[id];resetForm(form);
+  const title={txForm:'Record a trade',cashForm:'Record cash activity',accountForm:'Add account',instrumentForm:'Add holding',reconForm:'Add balance check'};
+  if(title[id])$(id==='txForm'?'txFormTitle':id==='cashForm'?'cashFormTitle':id==='accountForm'?'accountFormTitle':id==='instrumentForm'?'instrumentFormTitle':'reconFormTitle').textContent=title[id];
+  const cancel=form.querySelector('[data-cancel],#cancelEdit,#cancelCashEdit');if(cancel)cancel.hidden=true;
+  if(id==='docMetaForm')form.hidden=true;
+  updateTypeFields();
+}
+function updateTypeFields(){
+  const trade=$('editType').value,kind=$('cashType').value;
+  document.querySelectorAll('[data-trade-price]').forEach(el=>el.hidden=trade==='split');
+  document.querySelectorAll('[data-cash]').forEach(el=>el.hidden=!el.dataset.cash.split(' ').includes(kind));
+}
 async function saveForm(form,path,method='POST'){
   const d=formData(form);d.portfolio_id=state.pid;
-  await api(path,method,d);form.reset();await load();toast('Saved');
+  await api(path,method,d);resetForm(form);await load();toast('Saved');
+}
+function startEdit(formId, record, titleId, label, panel){
+  showManage(panel);const form=$(formId);state.editing[formId]=record.id;
+  populate(form,record);$(titleId).textContent=label;
+  const cancel=form.querySelector('[data-cancel],#cancelEdit,#cancelCashEdit');if(cancel)cancel.hidden=false;
+  form.scrollIntoView({behavior:'smooth',block:'start'});
+}
+function editDocument(id){
+  const d=state.docs.find(x=>x.id===id);if(!d)return;
+  showManage('files');const form=$('docMetaForm');form.hidden=false;state.editing.docMetaForm=id;
+  populate(form,d);form.scrollIntoView({behavior:'smooth',block:'start'});
+}
+function editRecon(id){const r=state.recon.find(x=>x.id===id);if(r)startEdit('reconForm',r,'reconFormTitle','Edit balance check','checks')}
+async function deleteRecord(kind,id){
+  const urls={tx:`/transactions/${id}`,account:`/accounts/${id}`,instrument:`/instruments/${id}`,doc:`/documents/${id}`,recon:`/reconciliations/${id}`};
+  if(!confirm(`Delete this ${({tx:'transaction',instrument:'holding',doc:'document',recon:'balance check'})[kind]||kind}?${kind==='instrument'?' Its price history will also be removed.':''}`))return;
+  await api(kind==='tx'||kind==='account'||kind==='doc'||kind==='recon'?query(urls[kind]):urls[kind],'DELETE');
+  await load();toast('Deleted');
 }
 function bind(){
   $('loginForm').addEventListener('submit',e=>{e.preventDefault();(async()=>{try{const d=formData(e.target);state.auth=await api('/login','POST',d);$('loginError').textContent='';await enter()}catch(err){$('loginError').textContent=err.message}})()});
   $('logout').onclick=()=>action(async()=>{await api('/logout','POST');location.reload()});
-  $('portfolioSelect').onchange=()=>action(async()=>{state.pid=Number($('portfolioSelect').value);show('overview');await load()});
-  document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>show(b.dataset.page));
+  $('portfolioSelect').onchange=()=>action(async()=>{state.pid=Number($('portfolioSelect').value);Object.keys(state.editing).forEach(cancelEditor);show('overview');await load()});
+  document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>b.dataset.page==='admin'?showManage(state.manage):show(b.dataset.page));
   $('backToOverview').onclick=()=>show('overview');
   $('holdings').addEventListener('click',e=>{const row=e.target.closest('[data-holding]');if(row){state.selectedHolding=Number(row.dataset.holding);show('holdingDetail');renderDetail()}});
   $('holdings').addEventListener('keydown',e=>{if((e.key==='Enter'||e.key===' ')&&e.target.dataset.holding){e.preventDefault();e.target.click()}});
@@ -151,12 +217,39 @@ function bind(){
   window.addEventListener('resize',()=>{if(state.dashboard&&state.page==='overview')drawChart();if(state.page==='holdingDetail')renderDetail()});
   for(const id of ['txSearch','txType','txAccount','txFrom','txTo'])$(id).addEventListener(id==='txSearch'?'input':'change',renderTransactions);
   for(const id of ['docHolding','docAccount','docYear'])$(id).addEventListener('change',renderDocs);
-  $('txList').onclick=e=>action(async()=>{const edit=e.target.closest('[data-edit]'),del=e.target.closest('[data-delete]');if(edit)editTransaction(Number(edit.dataset.edit));if(del&&confirm('Delete this transaction?')){await api(query(`/transactions/${del.dataset.delete}`),'DELETE');await load();toast('Deleted')}});
-  $('docList').onclick=e=>action(async()=>{const b=e.target.closest('[data-delete-doc]');if(b&&confirm('Delete this document?')){await api(query(`/documents/${b.dataset.deleteDoc}`),'DELETE');await load();toast('Deleted')}});
-  $('txForm').onsubmit=e=>{e.preventDefault();action(async()=>{const path=state.editId?`/transactions/${state.editId}`:'/transactions';await saveForm(e.target,path,state.editId?'PUT':'POST');state.editId=null;$('txFormTitle').textContent='Add transaction';$('cancelEdit').hidden=true})};
-  $('cancelEdit').onclick=()=>{state.editId=null;$('txFormTitle').textContent='Add transaction';$('txForm').reset();$('cancelEdit').hidden=true};
-  for(const [id,path] of [['accountForm','/accounts'],['instrumentForm','/instruments'],['priceForm','/prices'],['fxForm','/fx-rate'],['reconForm','/reconciliations']])$(id).onsubmit=e=>{e.preventDefault();action(()=>saveForm(e.target,path))};
+  $('txList').onclick=e=>action(async()=>{const edit=e.target.closest('[data-edit]'),del=e.target.closest('[data-delete]');if(edit)editTransaction(Number(edit.dataset.edit));if(del)await deleteRecord('tx',del.dataset.delete)});
+  $('docList').onclick=e=>action(async()=>{const edit=e.target.closest('[data-edit-doc]'),del=e.target.closest('[data-delete-doc]');if(edit)editDocument(Number(edit.dataset.editDoc));if(del)await deleteRecord('doc',del.dataset.deleteDoc)});
+  $('reconList').onclick=e=>action(async()=>{const edit=e.target.closest('[data-edit-recon]'),del=e.target.closest('[data-delete-recon]');if(edit)editRecon(Number(edit.dataset.editRecon));if(del)await deleteRecord('recon',del.dataset.deleteRecon)});
+  document.querySelectorAll('[data-manage]').forEach(b=>b.onclick=()=>showManage(b.dataset.manage));
+  document.querySelectorAll('[data-goto]').forEach(b=>b.onclick=()=>show(b.dataset.goto));
+  document.querySelectorAll('[data-cancel]').forEach(b=>b.onclick=()=>cancelEditor(b.dataset.cancel));
+  $('cancelEdit').onclick=()=>cancelEditor('txForm');$('cancelCashEdit').onclick=()=>cancelEditor('cashForm');
+  $('editType').onchange=updateTypeFields;$('cashType').onchange=updateTypeFields;
+  $('admin').onclick=e=>action(async()=>{
+    const b=e.target.closest('button[data-edit-tx],button[data-delete-tx],button[data-edit-account],button[data-delete-account],button[data-edit-instrument],button[data-delete-instrument],button[data-edit-price],button[data-delete-price],button[data-edit-fx],button[data-delete-fx],button[data-edit-doc],button[data-delete-doc],button[data-edit-recon],button[data-delete-recon]');
+    if(!b)return;
+    const attr=b.getAttributeNames().find(x=>x.startsWith('data-edit-')||x.startsWith('data-delete-'));
+    const [op,kind]=attr.slice(5).split('-'),id=b.getAttribute(attr);
+    if(op==='delete'){
+      if(kind==='price'){const [iid,day]=id.split('|');if(confirm('Delete this price?')){await api(`/prices/${iid}/${day}`,'DELETE');await load();toast('Deleted')}return}
+      if(kind==='fx'){if(confirm('Delete this exchange rate?')){await api(`/fx-rate/${id}`,'DELETE');await load();toast('Deleted')}return}
+      await deleteRecord(kind,id);return;
+    }
+    if(kind==='tx'){editTransaction(Number(id));return}
+    if(kind==='doc'){editDocument(Number(id));return}
+    if(kind==='recon'){editRecon(Number(id));return}
+    if(kind==='account'){const x=state.setup.accounts.find(a=>a.id===Number(id));if(x)startEdit('accountForm',x,'accountFormTitle','Edit account','accounts');return}
+    if(kind==='instrument'){const x=state.setup.instruments.find(a=>a.id===Number(id));if(x)startEdit('instrumentForm',x,'instrumentFormTitle','Edit holding','holdings');return}
+    if(kind==='price'){const [iid,day]=id.split('|');const p=state.prices.find(x=>String(x.instrument_id)===iid&&x.day===day);if(p){populate($('priceForm'),p);$('priceForm').scrollIntoView({behavior:'smooth',block:'start'});toast('Change the price and save to update it')}return}
+    if(kind==='fx'){const f=state.fx.find(x=>x.day===id);if(f){populate($('fxForm'),f);$('fxForm').scrollIntoView({behavior:'smooth',block:'start'});toast('Change the rate and save to update it')}}
+  });
+  $('txForm').onsubmit=e=>{e.preventDefault();action(async()=>{const form=e.target,d=formData(form),id=state.editing.txForm;d.portfolio_id=state.pid;d.amount=0;d.target_amount=0;d.tax=0;d.target_account_id='';if(d.type==='split'){d.price=0;d.fee=0;d.fx_rate=0}await api(id?`/transactions/${id}`:'/transactions',id?'PUT':'POST',d);cancelEditor('txForm');await load();toast(id?'Trade updated':'Trade saved')})};
+  $('cashForm').onsubmit=e=>{e.preventDefault();action(async()=>{const form=e.target,d=formData(form),id=state.editing.cashForm;d.portfolio_id=state.pid;d.quantity=0;d.price=0;if(d.type!=='dividend'){d.instrument_id='';d.tax=0}if(!['transfer','fx'].includes(d.type)){d.target_account_id='';d.target_amount=0;d.fee=0}if(d.type!=='fx')d.target_amount=0;if(!['deposit','withdrawal'].includes(d.type))d.fx_rate=0;await api(id?`/transactions/${id}`:'/transactions',id?'PUT':'POST',d);cancelEditor('cashForm');await load();toast(id?'Activity updated':'Activity saved')})};
+  for(const [id,path] of [['accountForm','/accounts'],['instrumentForm','/instruments'],['reconForm','/reconciliations']])$(id).onsubmit=e=>{e.preventDefault();action(async()=>{const rid=state.editing[id];await api(rid?`${path}/${rid}`:path,rid?'PUT':'POST',{...formData(e.target),portfolio_id:state.pid});cancelEditor(id);await load();toast(rid?'Updated':'Saved')})};
+  $('portfolioForm').onsubmit=e=>{e.preventDefault();action(async()=>{const name=field(e.target,'name').value;await api(`/portfolios/${state.pid}`,'PUT',{name});const opt=$('portfolioSelect').querySelector(`option[value="${state.pid}"]`);if(opt)opt.textContent=name;await load();toast('Portfolio renamed')})};
+  for(const [id,path] of [['priceForm','/prices'],['fxForm','/fx-rate']])$(id).onsubmit=e=>{e.preventDefault();action(()=>saveForm(e.target,path))};
   $('documentForm').onsubmit=e=>{e.preventDefault();action(async()=>{const data=new FormData(e.target);data.set('portfolio_id',state.pid);await api('/documents','POST',data);e.target.reset();await load();toast('Document uploaded')})};
+  $('docMetaForm').onsubmit=e=>{e.preventDefault();action(async()=>{await api(`/documents/${state.editing.docMetaForm}`,'PUT',{...formData(e.target),portfolio_id:state.pid});cancelEditor('docMetaForm');await load();toast('Document updated')})};
   $('passwordForm').onsubmit=e=>{e.preventDefault();action(async()=>{await api('/change-password','POST',formData(e.target));e.target.reset();toast('Password changed')})};
   $('refreshPrices').onclick=()=>action(async()=>{const result=await api('/refresh','POST');await load();toast(`Updated ${result.updated.length} holdings${result.errors.length?'; '+result.errors.join('; '):''}`,!!result.errors.length)});
   $('refreshFx').onclick=()=>action(async()=>{const r=await api('/fx-refresh','POST');await load();toast(`USD/AUD ${r.rate} on ${r.day}`)});
@@ -171,10 +264,9 @@ async function enter(){
   const setup=await api(query('/setup'));
   $('portfolioSelect').innerHTML=setup.portfolios.map(p=>`<option value="${p.id}">${esc(p.name)}</option>`).join('');
   $('portfolioSelect').value=state.pid;
-  $('editType').innerHTML=types.map(t=>`<option value="${t}">${t.toUpperCase()}</option>`).join('');
   $('txType').innerHTML='<option value="">All types</option>'+types.map(t=>`<option value="${t}">${t.toUpperCase()}</option>`).join('');
   const day=new Date().toLocaleDateString('en-CA');
   document.querySelectorAll('form input[type="date"]').forEach(el=>el.value=day);
-  await load();show('overview');
+  updateTypeFields();await load();show('overview');
 }
 bind();api('/auth').then(async a=>{if(a.authenticated){state.auth=a;await enter()}else if(!a.configured)$('loginError').textContent='Set account passwords in .env before signing in.'}).catch(e=>toast(e.message,true));

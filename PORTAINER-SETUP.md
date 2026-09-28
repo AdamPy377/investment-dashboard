@@ -61,7 +61,7 @@ In **Manage**, create each account, add holdings and enter your earliest deposit
 
 ## 5. Updates and backups
 
-For an update, change the source code, commit and push to `main`, then open the stack in Portainer and use **Pull and redeploy**. Ensure the image is rebuilt from the new repository code. The host mounts preserve your data even when the containers are replaced. If Portainer only reuses the old locally built image, enable the rebuild option shown in your version or rebuild the image on the Docker host before redeploying.
+For an update, change the source code, commit and push to `main`, then open the stack in Portainer and use **Pull and redeploy** with **Re-pull image and redeploy turned OFF**. This image is built locally from the Git checkout; `investment-dashboard:local` does not exist on Docker Hub. The Compose file sets `pull_policy: build` for all three services. The host mounts preserve your data when the containers are replaced.
 
 The daily backups are in your `HOST_BACKUP_DIR`, each in a dated folder with `portfolio.sqlite3` and `documents/`. Back up that folder to another device as well. To restore, stop the stack, copy one dated backup's database and documents back to `HOST_DATA_DIR`, correct ownership to `10001:10001`, then start the stack.
 

@@ -80,6 +80,8 @@ def init_db():
             transaction_id INTEGER NOT NULL, action TEXT NOT NULL, actor TEXT NOT NULL,
             before_json TEXT, after_json TEXT, changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
         ''')
+        if 'fx_rate' not in {column['name'] for column in c.execute('PRAGMA table_info(transactions)')}:
+            c.execute('ALTER TABLE transactions ADD COLUMN fx_rate REAL NOT NULL DEFAULT 0')
         for pid, label in [(1, os.getenv('ADMIN_USERNAME', 'Adam').title()),
                            (2, os.getenv('VIEWER_USERNAME', 'Brother').title())]:
             c.execute('INSERT OR IGNORE INTO portfolios(id,name) VALUES(?,?)', (pid, label))
@@ -251,6 +253,19 @@ def setup():
                        instruments=instruments)
 
 
+@app.put('/api/portfolios/<int:pid>')
+@auth(admin=True)
+def edit_portfolio(pid):
+    if pid not in (1, 2):
+        abort(404)
+    name = str((request.get_json() or {}).get('name', '')).strip()[:80]
+    if not name:
+        return problem('Enter a portfolio name')
+    with db() as c:
+        c.execute('UPDATE portfolios SET name=? WHERE id=?', (name, pid))
+    return jsonify(ok=True)
+
+
 @app.post('/api/accounts')
 @auth(admin=True)
 def add_account():
@@ -268,6 +283,41 @@ def add_account():
     return jsonify(ok=True)
 
 
+@app.put('/api/accounts/<int:aid>')
+@auth(admin=True)
+def edit_account(aid):
+    d, pid = request.get_json() or {}, portfolio_id()
+    name, broker = str(d.get('name', '')).strip()[:80], str(d.get('broker', '')).strip()[:80]
+    currency, kind = str(d.get('currency', '')).upper(), str(d.get('kind', ''))
+    if not name or currency not in ('AUD', 'USD') or kind not in ('broker', 'bank'):
+        return problem('Enter an account name, currency and type')
+    with db() as c:
+        old = get_owned(c, 'accounts', aid, pid)
+        if not old:
+            abort(404)
+        used = c.execute('SELECT 1 FROM transactions WHERE account_id=? OR target_account_id=? LIMIT 1', (aid, aid)).fetchone()
+        if used and currency != old['currency']:
+            return problem('Currency cannot change after transactions exist. Edit the transaction or add a new account.')
+        c.execute('UPDATE accounts SET name=?,broker=?,currency=?,kind=? WHERE id=?', (name, broker, currency, kind, aid))
+    return jsonify(ok=True)
+
+
+@app.delete('/api/accounts/<int:aid>')
+@auth(admin=True)
+def delete_account(aid):
+    pid = portfolio_id()
+    with db() as c:
+        if not get_owned(c, 'accounts', aid, pid):
+            abort(404)
+        for table, clause, params in [('transactions', 'account_id=? OR target_account_id=?', (aid, aid)),
+                                       ('documents', 'account_id=?', (aid,)),
+                                       ('reconciliations', 'account_id=?', (aid,))]:
+            if c.execute(f'SELECT 1 FROM {table} WHERE {clause} LIMIT 1', params).fetchone():
+                return problem(f'Account has {table}. Move or delete those records first.')
+        c.execute('DELETE FROM accounts WHERE id=? AND portfolio_id=?', (aid, pid))
+    return jsonify(ok=True)
+
+
 @app.post('/api/instruments')
 @auth(admin=True)
 def add_instrument():
@@ -279,8 +329,52 @@ def add_instrument():
     if not re.fullmatch(r'[A-Z0-9.\-]{1,20}', symbol) or exchange not in ('AU', 'US') or not name:
         return problem('Enter a name, ticker, and AU or US exchange')
     with db() as c:
-        c.execute('INSERT OR IGNORE INTO instruments(symbol,name,exchange,currency) VALUES(?,?,?,?)',
-                  (symbol, name, exchange, currency))
+        try:
+            c.execute('INSERT INTO instruments(symbol,name,exchange,currency) VALUES(?,?,?,?)',
+                      (symbol, name, exchange, currency))
+        except sqlite3.IntegrityError:
+            return problem('This ticker and exchange already exist. Edit the existing holding instead.')
+    return jsonify(ok=True)
+
+
+@app.put('/api/instruments/<int:iid>')
+@auth(admin=True)
+def edit_instrument(iid):
+    d = request.get_json() or {}
+    symbol = str(d.get('symbol', '')).strip().upper()
+    exchange = str(d.get('exchange', '')).strip().upper()
+    name = str(d.get('name', '')).strip()[:150]
+    if not re.fullmatch(r'[A-Z0-9.\-]{1,20}', symbol) or exchange not in ('AU', 'US') or not name:
+        return problem('Enter a name, ticker and AU or US exchange')
+    try:
+        with db() as c:
+            old = c.execute('SELECT * FROM instruments WHERE id=?', (iid,)).fetchone()
+            if not old:
+                abort(404)
+            used = c.execute('SELECT 1 FROM transactions WHERE instrument_id=? LIMIT 1', (iid,)).fetchone()
+            if used and exchange != old['exchange']:
+                return problem('Exchange cannot change after transactions exist.')
+            c.execute('UPDATE instruments SET symbol=?,name=?,exchange=?,currency=? WHERE id=?',
+                      (symbol, name, exchange, 'AUD' if exchange == 'AU' else 'USD', iid))
+            if symbol != old['symbol'] or exchange != old['exchange']:
+                c.execute("DELETE FROM prices WHERE instrument_id=? AND source LIKE 'EODHD%'", (iid,))
+        return jsonify(ok=True)
+    except sqlite3.IntegrityError:
+        return problem('A holding with this ticker and exchange already exists')
+
+
+@app.delete('/api/instruments/<int:iid>')
+@auth(admin=True)
+def delete_instrument(iid):
+    with db() as c:
+        if not c.execute('SELECT 1 FROM instruments WHERE id=?', (iid,)).fetchone():
+            abort(404)
+        if c.execute('SELECT 1 FROM transactions WHERE instrument_id=? LIMIT 1', (iid,)).fetchone():
+            return problem('Holding has transactions. Delete or correct those transactions first.')
+        if c.execute('SELECT 1 FROM documents WHERE instrument_id=? LIMIT 1', (iid,)).fetchone():
+            return problem('Holding has documents. Reassign or delete them first.')
+        c.execute('DELETE FROM prices WHERE instrument_id=?', (iid,))
+        c.execute('DELETE FROM instruments WHERE id=?', (iid,))
     return jsonify(ok=True)
 
 
@@ -302,6 +396,7 @@ def validate_transaction(c, d, pid):
     target_amount = num(d.get('target_amount', 0), 'Received amount')
     fee = num(d.get('fee', 0), 'Fee')
     tax = num(d.get('tax', 0), 'Tax withheld')
+    fx_rate = num(d.get('fx_rate', 0), 'FX rate')
     day = iso_day(d.get('occurred_at'))
     if kind in ('buy', 'sell') and (not instrument or instrument['currency'] != account['currency'] or quantity <= 0 or price <= 0):
         raise ValueError('Buy and sell need a holding, matching currency, quantity and price')
@@ -324,7 +419,7 @@ def validate_transaction(c, d, pid):
         target = None
     return (pid, account['id'], target['id'] if target else None,
             instrument['id'] if instrument else None, kind, day, quantity, price, amount,
-            target_amount, fee, tax, str(d.get('note', '')).strip()[:500])
+            target_amount, fee, tax, str(d.get('note', '')).strip()[:500], fx_rate)
 
 
 def check_positions(c, pid):
@@ -365,7 +460,7 @@ def create_transaction():
         with db() as c:
             values = validate_transaction(c, request.get_json() or {}, pid)
             cur = c.execute('''INSERT INTO transactions(portfolio_id,account_id,target_account_id,instrument_id,type,
-                occurred_at,quantity,price,amount,target_amount,fee,tax,note) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)''', values)
+                occurred_at,quantity,price,amount,target_amount,fee,tax,note,fx_rate) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)''', values)
             check_positions(c, pid)
             audit(c, pid, cur.lastrowid, 'create', after=c.execute('SELECT * FROM transactions WHERE id=?', (cur.lastrowid,)).fetchone())
         return jsonify(ok=True)
@@ -384,7 +479,7 @@ def update_transaction(tid):
                 return problem('Transaction not found', 404)
             values = validate_transaction(c, request.get_json() or {}, pid)
             c.execute('''UPDATE transactions SET portfolio_id=?,account_id=?,target_account_id=?,instrument_id=?,type=?,
-                occurred_at=?,quantity=?,price=?,amount=?,target_amount=?,fee=?,tax=?,note=? WHERE id=?''', values + (tid,))
+                occurred_at=?,quantity=?,price=?,amount=?,target_amount=?,fee=?,tax=?,note=?,fx_rate=? WHERE id=?''', values + (tid,))
             check_positions(c, pid)
             audit(c, pid, tid, 'update', before=old, after=c.execute('SELECT * FROM transactions WHERE id=?', (tid,)).fetchone())
         return jsonify(ok=True)
@@ -425,6 +520,28 @@ def add_price():
         return jsonify(ok=True)
     except (ValueError, TypeError) as e:
         return problem(str(e))
+
+
+@app.get('/api/prices')
+@auth(admin=True)
+def list_prices():
+    with db() as c:
+        return jsonify(rows(c, '''SELECT p.*,i.symbol,i.currency FROM prices p JOIN instruments i ON i.id=p.instrument_id
+            ORDER BY p.day DESC,i.symbol'''))
+
+
+@app.delete('/api/prices/<int:iid>/<day>')
+@auth(admin=True)
+def delete_price(iid, day):
+    try:
+        day = iso_day(day)
+    except ValueError:
+        abort(404)
+    with db() as c:
+        result = c.execute('DELETE FROM prices WHERE instrument_id=? AND day=?', (iid, day))
+        if not result.rowcount:
+            abort(404)
+    return jsonify(ok=True)
 
 
 def fetch_json(url):
@@ -509,6 +626,27 @@ def set_fx():
         return problem(str(e))
 
 
+@app.get('/api/fx-rates')
+@auth(admin=True)
+def list_fx():
+    with db() as c:
+        return jsonify(rows(c, 'SELECT * FROM fx ORDER BY day DESC'))
+
+
+@app.delete('/api/fx-rate/<day>')
+@auth(admin=True)
+def delete_fx(day):
+    try:
+        day = iso_day(day)
+    except ValueError:
+        abort(404)
+    with db() as c:
+        result = c.execute('DELETE FROM fx WHERE day=?', (day,))
+        if not result.rowcount:
+            abort(404)
+    return jsonify(ok=True)
+
+
 @app.post('/api/fx-refresh')
 @auth(admin=True)
 def refresh_fx():
@@ -585,16 +723,18 @@ def calculate(c, pid):
                 account_shares[(aid, iid)] = account_shares.get((aid, iid), 0) + q
             elif kind == 'deposit':
                 current_cash[aid] += amount
-                if t['currency'] == 'USD' and rate is None:
+                contribution_rate = t['fx_rate'] or rate
+                if t['currency'] == 'USD' and contribution_rate is None:
                     missing_contribution_fx = True
                 else:
-                    contributed_aud += amount * (rate if t['currency'] == 'USD' else 1)
+                    contributed_aud += amount * (contribution_rate if t['currency'] == 'USD' else 1)
             elif kind == 'withdrawal':
                 current_cash[aid] -= amount
-                if t['currency'] == 'USD' and rate is None:
+                contribution_rate = t['fx_rate'] or rate
+                if t['currency'] == 'USD' and contribution_rate is None:
                     missing_contribution_fx = True
                 else:
-                    contributed_aud -= amount * (rate if t['currency'] == 'USD' else 1)
+                    contributed_aud -= amount * (contribution_rate if t['currency'] == 'USD' else 1)
             elif kind == 'dividend':
                 current_cash[aid] += amount - tax - fee
             elif kind == 'interest':
@@ -737,6 +877,30 @@ def document_file(did):
     return response
 
 
+@app.put('/api/documents/<int:did>')
+@auth(admin=True)
+def edit_document(did):
+    d, pid = request.get_json() or {}, portfolio_id()
+    title = str(d.get('title', '')).strip()[:120]
+    if not title:
+        return problem('Enter a document title')
+    try:
+        iid = int(d['instrument_id']) if d.get('instrument_id') else None
+        aid = int(d['account_id']) if d.get('account_id') else None
+    except (ValueError, TypeError):
+        return problem('Invalid holding or account')
+    with db() as c:
+        if not get_owned(c, 'documents', did, pid):
+            abort(404)
+        if iid and not c.execute('SELECT 1 FROM instruments WHERE id=?', (iid,)).fetchone():
+            return problem('Holding not found')
+        if aid and not get_owned(c, 'accounts', aid, pid):
+            return problem('Account not found')
+        c.execute('UPDATE documents SET title=?,tax_year=?,instrument_id=?,account_id=? WHERE id=? AND portfolio_id=?',
+                  (title, str(d.get('tax_year', '')).strip()[:12], iid, aid, did, pid))
+    return jsonify(ok=True)
+
+
 @app.delete('/api/documents/<int:did>')
 @auth(admin=True)
 def delete_document(did):
@@ -774,6 +938,33 @@ def add_reconciliation():
         return jsonify(ok=True)
     except ValueError as e:
         return problem(str(e))
+
+
+@app.put('/api/reconciliations/<int:rid>')
+@auth(admin=True)
+def edit_reconciliation(rid):
+    d, pid = request.get_json() or {}, portfolio_id()
+    try:
+        day = iso_day(d.get('day'))
+        reported = num(d.get('reported_value'), 'Reported balance')
+        with db() as c:
+            if not get_owned(c, 'reconciliations', rid, pid) or not get_owned(c, 'accounts', d.get('account_id'), pid):
+                abort(404)
+            c.execute('UPDATE reconciliations SET account_id=?,day=?,reported_value=?,note=? WHERE id=? AND portfolio_id=?',
+                      (d['account_id'], day, reported, str(d.get('note', '')).strip()[:300], rid, pid))
+        return jsonify(ok=True)
+    except ValueError as e:
+        return problem(str(e))
+
+
+@app.delete('/api/reconciliations/<int:rid>')
+@auth(admin=True)
+def delete_reconciliation(rid):
+    with db() as c:
+        result = c.execute('DELETE FROM reconciliations WHERE id=? AND portfolio_id=?', (rid, portfolio_id()))
+        if not result.rowcount:
+            abort(404)
+    return jsonify(ok=True)
 
 
 @app.get('/api/export/transactions.csv')
