@@ -25,8 +25,9 @@ async function api(path,method='GET',body){
   if(body instanceof FormData) options.body=body;
   else if(body!==undefined){options.headers['Content-Type']='application/json';options.body=JSON.stringify(body)}
   const response=await fetch('/api'+path,options);
-  const data=await response.json().catch(()=>({error:'Server returned an unexpected response'}));
-  if(!response.ok) throw Error(data.error||'Request failed');
+  const data=await response.json().catch(()=>null);
+  if(!data)throw Error(`${method} /api${path.split('?')[0]} returned HTTP ${response.status} without JSON; check the investment-dashboard container logs.`);
+  if(!response.ok) throw Error(data.error||`${method} /api${path.split('?')[0]} failed (HTTP ${response.status})`);
   return data;
 }
 function query(path){return `${path}${path.includes('?')?'&':'?'}portfolio_id=${state.pid}`}

@@ -265,3 +265,20 @@ def test_reinvestment_rejects_wrong_portfolio_and_invalid_amounts(database):
     viewer=dashboard.app.test_client();vcsrf=login(viewer,'brother',os.environ['VIEWER_PASSWORD'])
     assert viewer.post('/api/reinvestments',json=payload,headers={'X-CSRF-Token':vcsrf}).status_code==403
     assert viewer.get('/api/reinvestments?portfolio_id=1').json==[]
+
+
+def test_docker_build_includes_runtime_modules(tmp_path):
+    """Reproduce Dockerfile COPY layout without requiring a Docker daemon."""
+    import shutil
+    project=Path(__file__).resolve().parents[1]
+    lines=project.joinpath('Dockerfile').read_text().splitlines()
+    copy=next(line for line in lines if line.startswith('COPY app.py '))
+    sources=copy.split()[1:-1]
+    for source in sources:
+        shutil.copy(project/source,tmp_path/source)
+    env={**os.environ,'DATA_DIR':str(tmp_path/'data'),'ADMIN_PASSWORD':'test-admin-secret-123',
+         'VIEWER_PASSWORD':'test-viewer-secret-123'}
+    result=subprocess.run([sys.executable,'-c',
+        "import app; c=app.app.test_client(); c.post('/api/login', json={'username':'adam','password':'test-admin-secret-123'}); assert c.get('/api/dashboard').status_code==200; assert c.get('/api/financial-year?end_year=2027').status_code==200"],
+        cwd=tmp_path,env=env,text=True,capture_output=True)
+    assert result.returncode==0,result.stderr
