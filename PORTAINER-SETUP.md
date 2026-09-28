@@ -51,6 +51,8 @@ Optional: `EODHD_API_KEY` for automatic US/ASX prices, `REFRESH_SECONDS` (defaul
 
 Select **Deploy the stack**. The `investment-dashboard`, `portfolio-price-worker`, and `portfolio-backup` containers should be running; the main container should show healthy. You don't need the Portainer 'relative path volumes' switch because this stack uses **absolute host paths**.
 
+If the web container reports **unhealthy**, the other services can still start so Portainer can show the container logs. Open **Containers → investment-dashboard → Logs** and inspect the health check's output. If the logs show a database permission error, confirm `HOST_DATA_DIR` points to the folder you prepared on the Docker host and that UID 10001 can write there. Do not delete the data directory to troubleshoot.
+
 ## 4. Open it and enter data
 
 From a device on your home network, open `http://YOUR-UBUNTU-SERVER-IP:3005` and sign in with your admin username and password. Your brother uses his separate login at the same address. Your admin account can switch portfolios at the top; his account is locked to his own portfolio on the server.

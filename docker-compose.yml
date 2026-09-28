@@ -45,8 +45,7 @@ services:
       TZ: Australia/Melbourne
     command: ["python", "worker.py"]
     depends_on:
-      investment-dashboard:
-        condition: service_healthy
+      - investment-dashboard
     volumes:
       - ${HOST_DATA_DIR:-/home/adam/docker/investment-dashboard/data}:/data
   backup:
@@ -63,8 +62,7 @@ services:
       TZ: Australia/Melbourne
     command: ["python", "backup.py"]
     depends_on:
-      investment-dashboard:
-        condition: service_healthy
+      - investment-dashboard
     volumes:
       - ${HOST_DATA_DIR:-/home/adam/docker/investment-dashboard/data}:/data:ro
       - ${HOST_BACKUP_DIR:-/home/adam/docker/investment-dashboard/backups}:/backups
