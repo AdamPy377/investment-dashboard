@@ -69,11 +69,12 @@ def init_db():
             day TEXT NOT NULL, close REAL NOT NULL, source TEXT NOT NULL, updated_at TEXT NOT NULL,
             PRIMARY KEY(instrument_id, day));
         CREATE TABLE IF NOT EXISTS fx(day TEXT PRIMARY KEY, usd_aud REAL NOT NULL, source TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS market_fetches(instrument_id INTEGER NOT NULL REFERENCES instruments(id) ON DELETE CASCADE,
+        CREATE TABLE IF NOT EXISTS fx_sync_attempts(day TEXT PRIMARY KEY);
+        CREATE TABLE IF NOT EXISTS yahoo_fetches(instrument_id INTEGER NOT NULL REFERENCES instruments(id) ON DELETE CASCADE,
             market_day TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, last_attempt TEXT NOT NULL,
             success INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(instrument_id,market_day));
-        CREATE TABLE IF NOT EXISTS alpha_usage(utc_day TEXT PRIMARY KEY, calls INTEGER NOT NULL DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS fx_sync_attempts(day TEXT PRIMARY KEY);
+        CREATE TABLE IF NOT EXISTS yahoo_backfills(instrument_id INTEGER PRIMARY KEY REFERENCES instruments(id) ON DELETE CASCADE,
+            first_buy TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS documents(id INTEGER PRIMARY KEY, portfolio_id INTEGER NOT NULL REFERENCES portfolios(id),
             instrument_id INTEGER REFERENCES instruments(id), account_id INTEGER REFERENCES accounts(id),
             tax_year TEXT NOT NULL DEFAULT '', title TEXT NOT NULL, original_name TEXT NOT NULL,
@@ -88,10 +89,10 @@ def init_db():
         if 'fx_rate' not in {column['name'] for column in c.execute('PRAGMA table_info(transactions)')}:
             c.execute('ALTER TABLE transactions ADD COLUMN fx_rate REAL NOT NULL DEFAULT 0')
         instrument_columns = {column['name'] for column in c.execute('PRAGMA table_info(instruments)')}
-        if 'av_symbol' not in instrument_columns:
-            c.execute("ALTER TABLE instruments ADD COLUMN av_symbol TEXT NOT NULL DEFAULT ''")
         if 'tv_symbol' not in instrument_columns:
             c.execute("ALTER TABLE instruments ADD COLUMN tv_symbol TEXT NOT NULL DEFAULT ''")
+        if 'yahoo_symbol' not in instrument_columns:
+            c.execute("ALTER TABLE instruments ADD COLUMN yahoo_symbol TEXT NOT NULL DEFAULT ''")
         recon_columns = {column['name'] for column in c.execute('PRAGMA table_info(reconciliations)')}
         if 'balance_scope' not in recon_columns:
             c.execute("ALTER TABLE reconciliations ADD COLUMN balance_scope TEXT NOT NULL DEFAULT 'cash'")
@@ -344,17 +345,17 @@ def add_instrument():
     symbol = str(d.get('symbol', '')).strip().upper()
     exchange = str(d.get('exchange', '')).strip().upper()
     name = str(d.get('name', '')).strip()[:150]
-    av_symbol = str(d.get('av_symbol', '')).strip().upper()
+    yahoo_symbol = str(d.get('yahoo_symbol', '')).strip().upper()
     tv_symbol = str(d.get('tv_symbol', '')).strip().upper()
     currency = 'AUD' if exchange == 'AU' else 'USD'
     if not re.fullmatch(r'[A-Z0-9.\-]{1,20}', symbol) or exchange not in ('AU', 'US') or not name:
         return problem('Enter a name, ticker, and AU or US exchange')
-    if (av_symbol and not re.fullmatch(r'[A-Z0-9.\-]{1,40}', av_symbol)) or (tv_symbol and not re.fullmatch(r'[A-Z0-9.\-]+:[A-Z0-9.\-]+', tv_symbol)):
+    if (yahoo_symbol and not re.fullmatch(r'[A-Z0-9.\-]{1,40}', yahoo_symbol)) or (tv_symbol and not re.fullmatch(r'[A-Z0-9.\-]+:[A-Z0-9.\-]+', tv_symbol)):
         return problem('Enter a valid provider symbol, such as ASX:VAS or NASDAQ:AMD')
     with db() as c:
         try:
-            c.execute('INSERT INTO instruments(symbol,name,exchange,currency,av_symbol,tv_symbol) VALUES(?,?,?,?,?,?)',
-                      (symbol, name, exchange, currency, av_symbol, tv_symbol))
+            c.execute('INSERT INTO instruments(symbol,name,exchange,currency,yahoo_symbol,tv_symbol) VALUES(?,?,?,?,?,?)',
+                      (symbol, name, exchange, currency, yahoo_symbol, tv_symbol))
         except sqlite3.IntegrityError:
             return problem('This ticker and exchange already exist. Edit the existing holding instead.')
     return jsonify(ok=True)
@@ -367,11 +368,11 @@ def edit_instrument(iid):
     symbol = str(d.get('symbol', '')).strip().upper()
     exchange = str(d.get('exchange', '')).strip().upper()
     name = str(d.get('name', '')).strip()[:150]
-    av_symbol = str(d.get('av_symbol', '')).strip().upper()
+    yahoo_symbol = str(d.get('yahoo_symbol', '')).strip().upper()
     tv_symbol = str(d.get('tv_symbol', '')).strip().upper()
     if not re.fullmatch(r'[A-Z0-9.\-]{1,20}', symbol) or exchange not in ('AU', 'US') or not name:
         return problem('Enter a name, ticker and AU or US exchange')
-    if (av_symbol and not re.fullmatch(r'[A-Z0-9.\-]{1,40}', av_symbol)) or (tv_symbol and not re.fullmatch(r'[A-Z0-9.\-]+:[A-Z0-9.\-]+', tv_symbol)):
+    if (yahoo_symbol and not re.fullmatch(r'[A-Z0-9.\-]{1,40}', yahoo_symbol)) or (tv_symbol and not re.fullmatch(r'[A-Z0-9.\-]+:[A-Z0-9.\-]+', tv_symbol)):
         return problem('Enter a valid provider symbol, such as ASX:VAS or NASDAQ:AMD')
     try:
         with db() as c:
@@ -381,13 +382,12 @@ def edit_instrument(iid):
             used = c.execute('SELECT 1 FROM transactions WHERE instrument_id=? LIMIT 1', (iid,)).fetchone()
             if used and exchange != old['exchange']:
                 return problem('Exchange cannot change after transactions exist.')
-            if symbol != old['symbol'] or exchange != old['exchange'] or av_symbol != old['av_symbol']:
-                c.execute("DELETE FROM prices WHERE instrument_id=? AND source='Alpha Vantage daily'", (iid,))
-                c.execute('DELETE FROM market_fetches WHERE instrument_id=?', (iid,))
-            c.execute('UPDATE instruments SET symbol=?,name=?,exchange=?,currency=?,av_symbol=?,tv_symbol=? WHERE id=?',
-                      (symbol, name, exchange, 'AUD' if exchange == 'AU' else 'USD', av_symbol, tv_symbol, iid))
-            if symbol != old['symbol'] or exchange != old['exchange']:
-                c.execute("DELETE FROM prices WHERE instrument_id=? AND source LIKE 'EODHD%'", (iid,))
+            if symbol != old['symbol'] or exchange != old['exchange'] or yahoo_symbol != old['yahoo_symbol']:
+                c.execute("DELETE FROM prices WHERE instrument_id=? AND source!='manual'", (iid,))
+                c.execute('DELETE FROM yahoo_fetches WHERE instrument_id=?', (iid,))
+                c.execute('DELETE FROM yahoo_backfills WHERE instrument_id=?', (iid,))
+            c.execute('UPDATE instruments SET symbol=?,name=?,exchange=?,currency=?,yahoo_symbol=?,tv_symbol=? WHERE id=?',
+                      (symbol, name, exchange, 'AUD' if exchange == 'AU' else 'USD', yahoo_symbol, tv_symbol, iid))
         return jsonify(ok=True)
     except sqlite3.IntegrityError:
         return problem('A holding with this ticker and exchange already exists')
@@ -594,105 +594,90 @@ def closed_market_day(exchange, now=None):
     return day.isoformat()
 
 
-def reserve_alpha_call():
-    today = datetime.now(ZoneInfo('UTC')).date().isoformat()
+def fetch_yahoo_history(symbol, start, end):
+    """Fetch unadjusted daily closes in the market's local trading dates."""
+    import yfinance as yf
+    frame = yf.Ticker(symbol).history(start=start, end=end, interval='1d',
+                                      auto_adjust=False, actions=False, timeout=20, raise_errors=True)
+    if frame.empty:
+        raise ValueError('No daily prices returned; check the Yahoo Finance symbol')
+    result = []
+    for trading_day, row in frame.iterrows():
+        day = trading_day.date().isoformat()
+        if start <= day < end:
+            try:
+                result.append((day, num(row['Close'], 'Daily close', False)))
+            except ValueError:
+                continue
+    if not result:
+        raise ValueError('No valid daily closing prices returned')
+    return result
+
+
+def sync_yahoo(result):
+    result['provider'] = 'Yahoo Finance'
     with db() as c:
-        c.execute('BEGIN IMMEDIATE')
-        c.execute('INSERT OR IGNORE INTO alpha_usage(utc_day,calls) VALUES(?,0)', (today,))
-        if c.execute('SELECT calls FROM alpha_usage WHERE utc_day=?', (today,)).fetchone()[0] >= 25:
-            return False
-        c.execute('UPDATE alpha_usage SET calls=calls+1 WHERE utc_day=?', (today,))
-    return True
-
-
-def alpha_request(params, key):
-    if not reserve_alpha_call():
-        return None
-    data = fetch_json('https://www.alphavantage.co/query?' + urllib.parse.urlencode({**params, 'apikey': key}))
-    if not isinstance(data, dict):
-        raise ValueError('Unexpected price feed response')
-    if any(field in data for field in ('Note', 'Information', 'Error Message')):
-        raise ValueError('Price feed limit or symbol error; check the symbol and try later')
-    return data
-
-
-def sync_alpha(result, key):
-    result['provider'] = 'Alpha Vantage'
-    with db() as c:
-        instruments = rows(c, '''SELECT i.* FROM instruments i JOIN transactions t ON t.instrument_id=i.id
+        # Include sold holdings: their past prices are needed for the historical portfolio graph.
+        instruments = rows(c, '''SELECT i.*, MIN(CASE WHEN t.type='buy' THEN t.occurred_at END) first_buy,
+            MAX(t.occurred_at) last_trade,
+            SUM(CASE WHEN t.type='sell' THEN -t.quantity ELSE t.quantity END) net_shares
+            FROM instruments i JOIN transactions t ON t.instrument_id=i.id
             WHERE t.type IN ('buy','sell','split') GROUP BY i.id
-            HAVING SUM(CASE WHEN t.type='sell' THEN -t.quantity ELSE t.quantity END)>0''')
-    # Rotate priority, so portfolios with more than 25 symbols take turns each day.
-    instruments.sort(key=lambda i: ((i['id'] + local_today().toordinal()) % max(len(instruments), 1)))
+            HAVING first_buy IS NOT NULL ORDER BY i.id''')
     for i in instruments:
         market_day = closed_market_day(i['exchange'])
-        with db() as c:
-            attempt = c.execute('SELECT * FROM market_fetches WHERE instrument_id=? AND market_day=?',
-                                (i['id'], market_day)).fetchone()
-        if attempt and (attempt['success'] or attempt['attempts'] >= 3 or
-                        datetime.now(ZoneInfo('UTC')) - datetime.fromisoformat(attempt['last_attempt']) < timedelta(hours=2)):
+        target_day = min(market_day, i['last_trade']) if i['net_shares'] <= 0.00000001 else market_day
+        if i['first_buy'] > target_day:
             continue
-        # A UTC budget is shared by manual refresh and the background worker.
         with db() as c:
-            used = c.execute('SELECT calls FROM alpha_usage WHERE utc_day=?',
-                             (datetime.now(ZoneInfo('UTC')).date().isoformat(),)).fetchone()
-        if used and used[0] >= 25:
-            result['deferred'].append('Daily Alpha Vantage request limit reached')
-            break
+            backfilled = c.execute('SELECT first_buy FROM yahoo_backfills WHERE instrument_id=?', (i['id'],)).fetchone()
+            fetched = c.execute('SELECT * FROM yahoo_fetches WHERE instrument_id=? AND market_day=?',
+                                (i['id'], target_day)).fetchone()
+            latest = c.execute("SELECT MAX(day) FROM prices WHERE instrument_id=? AND source='Yahoo Finance daily'",
+                               (i['id'],)).fetchone()[0]
+        needs_backfill = not backfilled or i['first_buy'] < backfilled['first_buy']
+        if i['net_shares'] <= 0.00000001 and not needs_backfill:
+            continue
+        if fetched and not (fetched['success'] and needs_backfill):
+            if (fetched['success'] or fetched['attempts'] >= 4 or
+                datetime.now(ZoneInfo('UTC')) - datetime.fromisoformat(fetched['last_attempt']) < timedelta(hours=2)):
+                continue
+        symbol = i['yahoo_symbol'] or (i['symbol'] + '.AX' if i['exchange'] == 'AU' else i['symbol'].replace('.', '-'))
+        start = i['first_buy'] if needs_backfill or not latest else max(i['first_buy'],
+                       (date.fromisoformat(latest) - timedelta(days=5)).isoformat())
+        end = (date.fromisoformat(target_day) + timedelta(days=1)).isoformat()
         try:
-            symbol = i['av_symbol']
-            if not symbol and i['exchange'] == 'AU':
-                lookup = alpha_request({'function': 'SYMBOL_SEARCH', 'keywords': i['symbol']}, key)
-                if lookup is None:
-                    result['deferred'].append('Daily request limit reached')
-                    break
-                matches = [m for m in lookup.get('bestMatches', [])
-                           if m.get('1. symbol', '').split('.')[0].upper() == i['symbol'].upper()
-                           and m.get('4. region', '').lower() == 'australia'
-                           and m.get('8. currency', '').upper() == 'AUD']
-                if len(matches) != 1:
-                    raise ValueError('Australian symbol was not verified; set its Alpha Vantage symbol in Manage → Holdings')
-                symbol = matches[0]['1. symbol']
-                with db() as c:
-                    c.execute("UPDATE instruments SET av_symbol=? WHERE id=? AND av_symbol=''", (symbol, i['id']))
-            symbol = symbol or i['symbol']
-            response = alpha_request({'function': 'TIME_SERIES_DAILY', 'symbol': symbol, 'outputsize': 'compact'}, key)
-            if response is None:
-                result['deferred'].append('Daily Alpha Vantage request limit reached')
-                break
-            daily = response.get('Time Series (Daily)')
-            if not isinstance(daily, dict) or not daily:
-                raise ValueError('No daily prices returned; check the Alpha Vantage symbol')
-            newest = max(daily)
+            history = fetch_yahoo_history(symbol, start, end)
+            newest = max(day for day, _ in history)
             stamp = datetime.now(ZoneInfo('UTC')).isoformat()
             with db() as c:
-                for day, values in daily.items():
+                for day, close in history:
                     c.execute('''INSERT INTO prices VALUES(?,?,?,?,?) ON CONFLICT(instrument_id,day) DO UPDATE SET
                         close=excluded.close,source=excluded.source,updated_at=excluded.updated_at
                         WHERE prices.source != 'manual' ''',
-                        (i['id'], iso_day(day), num(values['4. close'], 'Close', False), 'Alpha Vantage daily', stamp))
-                success = newest >= market_day
-                c.execute('''INSERT INTO market_fetches VALUES(?,?,?,?,?) ON CONFLICT(instrument_id,market_day)
-                    DO UPDATE SET attempts=market_fetches.attempts+1,last_attempt=excluded.last_attempt,success=excluded.success''',
-                    (i['id'], market_day, 1, stamp, int(success)))
+                        (i['id'], day, close, 'Yahoo Finance daily', stamp))
+                if needs_backfill:
+                    c.execute('''INSERT INTO yahoo_backfills(instrument_id,first_buy) VALUES(?,?)
+                        ON CONFLICT(instrument_id) DO UPDATE SET first_buy=excluded.first_buy''',
+                        (i['id'], i['first_buy']))
+                success = newest >= target_day
+                c.execute('''INSERT INTO yahoo_fetches VALUES(?,?,?,?,?) ON CONFLICT(instrument_id,market_day)
+                    DO UPDATE SET attempts=yahoo_fetches.attempts+1,last_attempt=excluded.last_attempt,
+                    success=excluded.success''', (i['id'], target_day, 1, stamp, int(success)))
             result['updated'].append(i['symbol'])
-            if not success:
+            if not success and i['net_shares'] > 0.00000001:
                 result['deferred'].append(i['symbol'] + ': latest published close is ' + newest)
         except Exception as e:
-            # Never include request URLs, which contain credentials, in messages or logs.
-            result['errors'].append(i['symbol'] + ': ' + ('Price feed unavailable' if isinstance(e, OSError)
-                                                          else str(e).replace(key, '[redacted]')[:110]))
+            result['errors'].append(i['symbol'] + ': ' + str(e)[:140])
+            stamp = datetime.now(ZoneInfo('UTC')).isoformat()
             with db() as c:
-                stamp = datetime.now(ZoneInfo('UTC')).isoformat()
-                c.execute('''INSERT INTO market_fetches VALUES(?,?,?,?,0) ON CONFLICT(instrument_id,market_day)
-                    DO UPDATE SET attempts=market_fetches.attempts+1,last_attempt=excluded.last_attempt''',
-                    (i['id'], market_day, 1, stamp))
+                c.execute('''INSERT INTO yahoo_fetches VALUES(?,?,?,?,0) ON CONFLICT(instrument_id,market_day)
+                    DO UPDATE SET attempts=yahoo_fetches.attempts+1,last_attempt=excluded.last_attempt,success=0''',
+                    (i['id'], target_day, 1, stamp))
 
 
 def sync_market():
-    result = {'updated': [], 'errors': [], 'deferred': [], 'provider': 'Manual'}
-    alpha_key = os.getenv('ALPHA_VANTAGE_API_KEY', '').strip()
-    key = os.getenv('EODHD_API_KEY', '').strip()
+    result = {'updated': [], 'errors': [], 'deferred': [], 'provider': 'Yahoo Finance'}
     with db() as c:
         earliest_usd = c.execute('''SELECT MIN(t.occurred_at) FROM transactions t JOIN accounts a ON a.id=t.account_id
             WHERE a.currency='USD' ''').fetchone()[0]
@@ -712,43 +697,7 @@ def sync_market():
                 c.execute('INSERT OR IGNORE INTO fx_sync_attempts(day) VALUES(?)', (fx_day,))
             except Exception as e:
                 result['errors'].append('FX: ' + str(e)[:90])
-        if not alpha_key and not key:
-            return result
-        if not alpha_key:
-            result['provider'] = 'EODHD'
-        instruments = rows(c, '''SELECT i.*, MIN(t.occurred_at) first_day FROM instruments i
-            JOIN transactions t ON t.instrument_id=i.id GROUP BY i.id''')
-        for i in ([] if alpha_key else instruments):
-            ticker = urllib.parse.quote(i['symbol'] + '.' + i['exchange'])
-            params = {'api_token': key, 'fmt': 'json'}
-            latest = c.execute('SELECT MAX(day) FROM prices WHERE instrument_id=? AND source=?',
-                               (i['id'], 'EODHD daily')).fetchone()[0]
-            params['from'] = max(i['first_day'], str(date.fromisoformat(latest) - timedelta(days=2))) if latest else i['first_day']
-            try:
-                historical = fetch_json(f'https://eodhd.com/api/eod/{ticker}?' + urllib.parse.urlencode(params))
-                if not isinstance(historical, list):
-                    raise ValueError('Historical feed returned an error')
-                for p in historical:
-                    c.execute('''INSERT INTO prices VALUES(?,?,?,?,?) ON CONFLICT(instrument_id,day) DO UPDATE SET
-                        close=excluded.close,source=excluded.source,updated_at=excluded.updated_at
-                        WHERE prices.source != 'manual' ''',
-                              (i['id'], iso_day(p['date']), num(p['close'], 'Close', False),
-                               'EODHD daily', datetime.utcnow().isoformat() + 'Z'))
-                current = fetch_json(f'https://eodhd.com/api/real-time/{ticker}?' +
-                                     urllib.parse.urlencode({'api_token': key, 'fmt': 'json'}))
-                close = num(current.get('close'), 'Price', False)
-                stamp = current.get('timestamp')
-                zone = ZoneInfo('America/New_York' if i['exchange'] == 'US' else 'Australia/Sydney')
-                price_day = datetime.fromtimestamp(int(stamp), zone).date().isoformat() if stamp else local_today().isoformat()
-                c.execute('''INSERT INTO prices VALUES(?,?,?,?,?) ON CONFLICT(instrument_id,day) DO UPDATE SET
-                    close=excluded.close, source=excluded.source, updated_at=excluded.updated_at
-                    WHERE prices.source != 'manual' ''',
-                    (i['id'], price_day, close, 'EODHD delayed', datetime.utcnow().isoformat() + 'Z'))
-                result['updated'].append(i['symbol'])
-            except Exception as e:
-                result['errors'].append(f"{i['symbol']}: {str(e)[:90]}")
-    if alpha_key:
-        sync_alpha(result, alpha_key)
+    sync_yahoo(result)
     return result
 
 
