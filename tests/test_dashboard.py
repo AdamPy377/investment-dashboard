@@ -224,6 +224,7 @@ def test_reinvestment_is_atomic_editable_and_keeps_dividend_income(database):
         iid=instrument(c,'VAS')
         cash_tx(c,1,aid,'deposit','2026-01-01',100)
         trade(c,1,aid,iid,'buy','2026-01-01',2,10)
+        price(c,iid,'2026-09-20',12)
         price(c,iid,'2026-09-29',12)
     client=dashboard.app.test_client()
     csrf=login(client,'adam',os.environ['ADMIN_PASSWORD'])
@@ -237,18 +238,35 @@ def test_reinvestment_is_atomic_editable_and_keeps_dividend_income(database):
     with database() as c:
         result=dashboard.calculate(c,1)
         assert result['holdings'][0]['quantity']==3
-        assert result['cash'][0]['balance']==pytest.approx(81)
+        assert result['cash'][0]['balance']==pytest.approx(80)
+        assert result['drp_balances'][0]['balance']==pytest.approx(1)
+        assert result['value']==pytest.approx(117)
+        payment_day=next(p for p in result['series'] if p['day']=='2026-09-20')
+        assert payment_day['value']==pytest.approx(113)
         from reports import financial_year
         report=financial_year(c,1,2027)
         assert report['totals']['dividend_aud']==pytest.approx(10)
         assert report['totals']['franking_credit_aud']==pytest.approx(2)
     assert client.put(f"/api/transactions/{response.json['buy_transaction_id']}",json=payload,headers=headers).status_code==400
     payload['quantity']=2
+    payload['price']=4
     assert client.put(f'/api/reinvestments/{rid}',json=payload,headers=headers).status_code==200
     with database() as c:
         result=dashboard.calculate(c,1)
         assert result['holdings'][0]['quantity']==4
-        assert result['cash'][0]['balance']==pytest.approx(73)
+        assert result['cash'][0]['balance']==pytest.approx(80)
+        assert result['drp_balances'][0]['balance']==pytest.approx(1)
+    next_payment={**payload,'dividend_day':'2026-09-25','buy_day':'2026-09-26',
+                  'amount':5,'tax':0,'franking_credit':0,'quantity':3,'price':2}
+    next_response=client.post('/api/reinvestments',json=next_payment,headers=headers)
+    assert next_response.status_code==200,next_response.json
+    with database() as c:
+        result=dashboard.calculate(c,1)
+        assert result['cash'][0]['balance']==pytest.approx(80)
+        assert result['holdings'][0]['quantity']==7
+        assert result['drp_balances']==[]
+    assert client.delete(f'/api/reinvestments/{rid}?portfolio_id=1',headers=headers).status_code==400
+    assert client.delete(f"/api/reinvestments/{next_response.json['id']}?portfolio_id=1",headers=headers).status_code==200
     assert client.delete(f'/api/reinvestments/{rid}?portfolio_id=1',headers=headers).status_code==200
     with database() as c:
         assert dashboard.calculate(c,1)['holdings'][0]['quantity']==2

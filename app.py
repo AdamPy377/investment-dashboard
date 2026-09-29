@@ -512,6 +512,24 @@ def check_positions(c, pid):
             raise ValueError('A sale exceeds shares held in that account on that date')
 
 
+def check_reinvestment_balances(c, pid):
+    linked = {}
+    for group in c.execute('SELECT dividend_transaction_id,buy_transaction_id FROM reinvestments WHERE portfolio_id=?', (pid,)):
+        linked[group['dividend_transaction_id']] = 'dividend'
+        linked[group['buy_transaction_id']] = 'buy'
+    balances = {}
+    for t in c.execute('''SELECT id,account_id,instrument_id,amount,tax,fee,quantity,price FROM transactions
+        WHERE portfolio_id=? ORDER BY occurred_at,id''', (pid,)):
+        kind = linked.get(t['id'])
+        if not kind:
+            continue
+        key = t['account_id'], t['instrument_id']
+        delta = t['amount'] - t['tax'] if kind == 'dividend' else -t['quantity'] * t['price'] - t['fee']
+        balances[key] = balances.get(key, 0) + delta
+        if balances[key] < -0.005:
+            raise ValueError('Reinvested shares cost more than this holding’s available DRP balance. Check the dividend, carried balance, units and allotment price.')
+
+
 def audit(c, pid, tid, action, before=None, after=None):
     c.execute('''INSERT INTO transaction_audit(portfolio_id,transaction_id,action,actor,before_json,after_json)
         VALUES(?,?,?,?,?,?)''', (pid, tid, action, session['username'],
@@ -817,6 +835,9 @@ def calculate(c, pid):
         ORDER BY t.occurred_at,t.id''', (pid,))
     accounts = rows(c, 'SELECT * FROM accounts WHERE portfolio_id=?', (pid,))
     instruments = {i['id']: i for i in rows(c, 'SELECT * FROM instruments')}
+    reinvested_ids = set()
+    for group in c.execute('SELECT dividend_transaction_id,buy_transaction_id FROM reinvestments WHERE portfolio_id=?', (pid,)):
+        reinvested_ids.update((group['dividend_transaction_id'], group['buy_transaction_id']))
     prices = rows(c, 'SELECT * FROM prices ORDER BY day')
     fx = rows(c, 'SELECT * FROM fx ORDER BY day')
     today = local_today()
@@ -825,6 +846,7 @@ def calculate(c, pid):
     # The graph is daily; no price before a first observed quote is invented.
     days = sorted({str(start + timedelta(days=n)) for n in range((today - start).days + 1)})
     current_cash = {a['id']: 0.0 for a in accounts}
+    drp_residuals = {}
     shares = {}
     account_shares = {}
     costs = {}
@@ -850,7 +872,11 @@ def calculate(c, pid):
             aid, iid, kind = t['account_id'], t['instrument_id'], t['type']
             q, p, amount, fee, tax = (t[x] for x in ('quantity', 'price', 'amount', 'fee', 'tax'))
             if kind == 'buy':
-                current_cash[aid] -= q * p + fee
+                if t['id'] in reinvested_ids:
+                    key = aid, iid
+                    drp_residuals[key] = drp_residuals.get(key, 0) - q * p - fee
+                else:
+                    current_cash[aid] -= q * p + fee
                 shares[iid] = shares.get(iid, 0) + q
                 account_shares[(aid, iid)] = account_shares.get((aid, iid), 0) + q
                 account_costs[(aid, iid)] = account_costs.get((aid, iid), 0) + q * p + fee
@@ -884,7 +910,11 @@ def calculate(c, pid):
                 else:
                     contributed_aud -= amount * (contribution_rate if t['currency'] == 'USD' else 1)
             elif kind == 'dividend':
-                current_cash[aid] += amount - tax - fee
+                if t['id'] in reinvested_ids:
+                    key = aid, iid
+                    drp_residuals[key] = drp_residuals.get(key, 0) + amount - tax - fee
+                else:
+                    current_cash[aid] += amount - tax - fee
             elif kind == 'interest':
                 current_cash[aid] += amount - tax
             elif kind == 'fee':
@@ -905,6 +935,8 @@ def calculate(c, pid):
             quote_idx[iid] = idx
         values = {'AUD': sum(current_cash[a['id']] for a in accounts if a['currency'] == 'AUD'),
                   'USD': sum(current_cash[a['id']] for a in accounts if a['currency'] == 'USD')}
+        for (aid, iid), balance in drp_residuals.items():
+            values[instruments[iid]['currency']] += balance
         unpriced = []
         for iid, qty in shares.items():
             if qty <= 0.00000001:
@@ -934,6 +966,7 @@ def calculate(c, pid):
                 label = account_by_id[aid]['broker'].strip() or account_by_id[aid]['name']
                 brokers[label] = brokers.get(label, 0) + held
         holdings.append({**inst, 'quantity': qty, 'cost': costs.get(iid, 0),
+                         'drp_residual': sum(balance for (aid, holding_id), balance in drp_residuals.items() if holding_id == iid),
                          'brokers': [{'name': name, 'quantity': held} for name, held in sorted(brokers.items())],
                          'avg_cost': costs.get(iid, 0) / qty if qty else 0,
                          'price': quote['close'] if quote else None,
@@ -945,11 +978,17 @@ def calculate(c, pid):
                          'prices': price_history.get(iid, [])})
     holdings.sort(key=lambda h: (h['value'] or 0) * (rate if h['currency'] == 'USD' and rate else 1), reverse=True)
     cash = [{**a, 'balance': current_cash[a['id']]} for a in accounts]
+    drp_balances = [{'account_id': aid, 'account_name': account_by_id[aid]['name'],
+                     'instrument_id': iid, 'symbol': instruments[iid]['symbol'],
+                     'currency': instruments[iid]['currency'], 'balance': balance}
+                    for (aid, iid), balance in drp_residuals.items() if abs(balance) > .000001]
+    drp_balances.sort(key=lambda x: (x['symbol'],x['account_name']))
     current = series[-1]
     # Current positions at their last two published closes. Trades and cash transfers
     # are excluded; USD exposure includes the move between the last two FX fixes.
     session_move = 0.0
-    prior_usd_exposure = sum(current_cash[a['id']] for a in accounts if a['currency'] == 'USD')
+    prior_usd_exposure = sum(current_cash[a['id']] for a in accounts if a['currency'] == 'USD') + sum(
+        b['balance'] for b in drp_balances if b['currency'] == 'USD')
     missing_session_data = False
     stale_holdings = []
     for holding in holdings:
@@ -979,7 +1018,7 @@ def calculate(c, pid):
             session_move += prior_usd_exposure * (rate - previous_rate)
     session_move = None if missing_session_data or current['value'] is None else session_move
     from reports import cashflow_returns
-    return {'holdings': holdings, 'cash': cash, 'series': series,
+    return {'holdings': holdings, 'cash': cash, 'drp_balances': drp_balances, 'series': series,
             'returns': cashflow_returns(series),
             'value': current['value'], 'invested': current['invested'],
             'profit': current['value'] - current['invested'] if current['value'] is not None and current['invested'] is not None else None,
@@ -1433,6 +1472,7 @@ def add_reinvestment():
             check_positions(c,pid)
             rid=c.execute('INSERT INTO reinvestments(portfolio_id,dividend_transaction_id,buy_transaction_id) VALUES(?,?,?)',
                           (pid,first,second)).lastrowid
+            check_reinvestment_balances(c,pid)
             for tid in (first,second):
                 audit(c,pid,tid,'create',after=c.execute('SELECT * FROM transactions WHERE id=?',(tid,)).fetchone())
         return jsonify(ok=True,id=rid,dividend_transaction_id=first,buy_transaction_id=second)
@@ -1454,6 +1494,7 @@ def edit_reinvestment(rid):
                 c.execute(f'UPDATE transactions SET {TX_SET} WHERE id=?',values+(tid,))
                 audit(c,pid,tid,'update',before=old,after=c.execute('SELECT * FROM transactions WHERE id=?',(tid,)).fetchone())
             check_positions(c,pid)
+            check_reinvestment_balances(c,pid)
         return jsonify(ok=True)
     except (ValueError,sqlite3.IntegrityError) as exc:
         return problem(str(exc))
@@ -1474,6 +1515,7 @@ def delete_reinvestment(rid):
                 c.execute('DELETE FROM transactions WHERE id=?',(tx['id'],))
                 audit(c,pid,tx['id'],'delete',before=tx)
             check_positions(c,pid)
+            check_reinvestment_balances(c,pid)
         return jsonify(ok=True)
     except ValueError as exc:
         return problem(str(exc))

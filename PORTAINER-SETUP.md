@@ -61,7 +61,7 @@ In **Manage**, create each account, add holdings and enter your earliest deposit
 
 Use **Manage → CSV import** to preview and import the dashboard export from this same database or a CSV converted to the downloadable template. Broker CSVs have not been verified against Stake or Pearler source files, so check the mappings before importing. Cash corrections are skipped; record actual cash deposits on their original dates. Each portfolio has its own financial-year schedule under **Documents**. This release adds a `franking_credit` column automatically on startup and preserves all existing data. Historical calculations remain dependent on complete transaction, closing price and FX records.
 
-For reinvested dividends, use **Manage → Dividend reinvestment**. The form saves a linked dividend and purchase together, with separate payment and share allotment dates. Existing transactions are unaffected by the added `reinvestments` table; a previous manually entered dividend plus buy should not be entered again through the new form.
+For reinvested dividends, use **Manage → Dividend reinvestment**. The form saves a linked dividend and purchase together, with separate payment and share allotment dates. Linked reinvestments created in v2.5 now keep any residual with the share registry rather than adding it to broker cash. Reconcile broker cash after redeployment if you previously applied a balance check to remove that residual. A previous manually entered dividend plus buy is not automatically linked and should not be entered again through the form.
 
 ## 5. Updates and backups
 
