@@ -54,3 +54,7 @@ The viewer can read Decisions and research only within their assigned portfolio.
 ### Updating from v2.7
 
 Keep your existing persistent data directory and stack environment variables. Upload all release files, including `journal.py`, `static/journal.js` and the updated `Dockerfile`, to the repository and rebuild/redeploy the Portainer stack. The existing database gains three new tables automatically; transactions and DRP balances are preserved. Existing holding transactions populate the timeline immediately. Your explanations can then be added to historical events.
+
+## v2.9 — Latest decision per holding
+
+Decisions now displays one card per holding: its latest event, ordered newest first. Open the holding to see all its dated events below the research and charts. Filters apply to each holding’s latest event. The holding details page places All holdings on the left and Decisions & research on the right in one navigation row. Update from v2.8 by replacing release files and rebuilding the stack; keep the existing data directory.

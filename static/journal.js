@@ -28,7 +28,12 @@ function eventCard(e,compact=false){
 function renderDecisions(){
   if(!state.journal)return;
   const text=$('decisionSearch').value.toLowerCase(),iid=$('decisionHolding').value,kind=$('decisionKind').value;
-  const events=state.journal.events.filter(e=>(!iid||String(e.instrument_id)===iid)&&(!kind||e.kind===kind)&&JSON.stringify([e.symbol,e.name,e.note,e.notes]).toLowerCase().includes(text));
+  const seen=new Set();
+  const latest=state.journal.events.filter(e=>{
+    if(seen.has(e.instrument_id))return false;
+    seen.add(e.instrument_id);return true;
+  });
+  const events=latest.filter(e=>(!iid||String(e.instrument_id)===iid)&&(!kind||e.kind===kind)&&JSON.stringify([e.symbol,e.name,e.note,e.notes]).toLowerCase().includes(text));
   $('decisionList').innerHTML=events.length?events.map(e=>eventCard(e)).join(''):empty('No matching events. Holding transactions appear here automatically; add a review to record a plan.');
 }
 function inputLabel(label,name,type='text',value=''){return `<label>${esc(label)}<input name="${name}" type="${type}" value="${esc(value??'')}" ${type==='number'?'min="0" step="any"':''}></label>`}

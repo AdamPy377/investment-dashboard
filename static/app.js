@@ -209,7 +209,7 @@ function renderDetail(){
   <div class="two-col"><div class="card"><h2>Transactions</h2>${tx.length?tx.map(t=>`<div class="row"><div class="row-main"><b>${esc(t.type)} · ${esc(t.occurred_at)}</b><small>${esc(t.account_name)} · ${number(t.quantity)} shares</small></div><div class="row-side ${signClass(cashMovement(t))}">${money(cashMovement(t),t.currency)}</div></div>`).join(''):empty('No transactions.')}</div>
   <div class="card"><h2>Documents</h2>${docs.length?docs.map(d=>`<div class="row"><div class="row-main"><b>${esc(d.title)}</b><small>${esc(d.tax_year||d.original_name)}</small></div><a href="/api/documents/${d.id}/file" target="_blank" rel="noopener">Open</a></div>`).join(''):empty('No documents attached to this holding.')}</div></div>
   <div class="card"><h2>Recent price history</h2>${priceRows.length?priceRows.map(p=>`<div class="row"><span>${esc(p.day)} <small class="muted">${esc(p.source)}</small></span><b class="${signClass(p.close)}">${money(p.close,h.currency)}</b></div>`).join(''):empty('Add prices manually or connect a delayed price feed.')}</div>`;
-  const researchLink=document.createElement('button');researchLink.className='ghost';researchLink.textContent='Decisions & research →';researchLink.onclick=()=>{state.researchHolding=h.id;show('decisionHoldingDetail');renderResearch()};$('detailContent').prepend(researchLink);
+  $('holdingResearchLink').onclick=()=>{state.researchHolding=h.id;show('decisionHoldingDetail');renderResearch()};
   renderTradingViewOverview(h);
 }
 function renderTradingViewOverview(h){
