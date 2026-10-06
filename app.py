@@ -51,6 +51,18 @@ def db():
 def init_db():
     with db() as c:
         c.executescript('''
+        CREATE TABLE IF NOT EXISTS decision_notes(
+            portfolio_id INTEGER NOT NULL REFERENCES portfolios(id),
+            transaction_id INTEGER NOT NULL REFERENCES transactions(id) ON DELETE CASCADE,
+            data TEXT NOT NULL, PRIMARY KEY(portfolio_id,transaction_id));
+        CREATE TABLE IF NOT EXISTS decision_reviews(id INTEGER PRIMARY KEY,
+            portfolio_id INTEGER NOT NULL REFERENCES portfolios(id),
+            instrument_id INTEGER NOT NULL REFERENCES instruments(id) ON DELETE CASCADE,
+            day TEXT NOT NULL, kind TEXT NOT NULL, data TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS holding_research(
+            portfolio_id INTEGER NOT NULL REFERENCES portfolios(id),
+            instrument_id INTEGER NOT NULL REFERENCES instruments(id) ON DELETE CASCADE,
+            data TEXT NOT NULL, PRIMARY KEY(portfolio_id,instrument_id));
         CREATE TABLE IF NOT EXISTS portfolios(id INTEGER PRIMARY KEY, name TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, username TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL, role TEXT NOT NULL, portfolio_id INTEGER NOT NULL REFERENCES portfolios(id));
@@ -1519,3 +1531,7 @@ def delete_reinvestment(rid):
         return jsonify(ok=True)
     except ValueError as exc:
         return problem(str(exc))
+
+
+from journal import register_journal
+register_journal(app, globals())

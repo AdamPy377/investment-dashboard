@@ -38,3 +38,19 @@ Run `pip install -r requirements-dev.txt` and `pytest -q` to exercise the ledger
 ## Updating an existing Portainer installation
 
 Replace the repository files and redeploy the stack from its GitHub source. Keep the same Portainer environment variables and mounted data and backup directories. The application adds its new transaction FX column automatically on startup; do not delete the SQLite database or the documents directory. If Portainer offers **Re-pull image**, leave it off: this stack builds the local `investment-dashboard:local` image from the repository rather than pulling it from a registry.
+
+## v2.8 — Decisions and holding research
+
+Open **Decisions** in either portfolio. All holding transactions, including fully sold holdings, appear newest first. Admin can select **Edit decision** to record reasoning, expectations, risks, a target price/date, hold or exit rules, use of sale proceeds and lessons. **Add review** creates a dated hold/review/plan-change event without changing balances. Original decisions stay attached to their own events: add a new review when your thesis changes.
+
+Expected profit uses either that trade's units and price (buy brokerage included) or the average position cost and quantity at that event. You can enter estimated exit fees and income. This scenario excludes tax and FX. Sale profit uses a pooled cost per broker account; it is illustrative rather than a FIFO tax result. Transaction edits update their events; deletion removes the linked note. Dated reviews remain independent.
+
+Click a holding name to see its portfolio-specific research, exposures/business description, role, risks/overlap, entry reasoning, alternatives, allocation plan and source notes. This page retains fully sold holdings and shows saved price history with trade markers, current metrics, recorded dividends and period drawdown. Research notes are written by you; no AI subscription is needed and explanations are not fabricated from a ticker.
+
+Admin can select up to five comparison instruments in **Edit research**. Add alternatives via **Manage → Holdings** and save their dated quotes in **Prices & FX**. Comparisons use two or more exact common saved dates, start at 0%, and exclude income, fees, FX and tax. Charts are based on saved prices, not live prices, and do not adjust for stock splits. Missing history is shown as unavailable.
+
+The viewer can read Decisions and research only within their assigned portfolio. Admin edits are saved separately for each portfolio, even when both own the same ticker.
+
+### Updating from v2.7
+
+Keep your existing persistent data directory and stack environment variables. Upload all release files, including `journal.py`, `static/journal.js` and the updated `Dockerfile`, to the repository and rebuild/redeploy the Portainer stack. The existing database gains three new tables automatically; transactions and DRP balances are preserved. Existing holding transactions populate the timeline immediately. Your explanations can then be added to historical events.

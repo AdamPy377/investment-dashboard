@@ -39,7 +39,8 @@ function show(page){
   state.page=page;
   document.querySelectorAll('.page').forEach(el=>el.hidden=el.id!==page);
   document.querySelectorAll('nav button').forEach(el=>el.classList.toggle('active',el.dataset.page===page));
-  $('pageTitle').textContent=({overview:'Overview',transactions:'Transactions',cash:'Cash balances',documents:'Documents',reconcile:'Reconcile',admin:'Manage',holdingDetail:'Holding details',settings:'Settings'})[page];
+  $('pageTitle').textContent=({decisions:'Decisions',decisionHoldingDetail:'Holding research',overview:'Overview',transactions:'Transactions',cash:'Cash balances',documents:'Documents',reconcile:'Reconcile',admin:'Manage',holdingDetail:'Holding details',settings:'Settings'})[page];
+  if(page==='decisions'&&state.journal)renderDecisions();
   if(page==='overview'&&state.dashboard)requestAnimationFrame(drawChart);
   window.scrollTo({top:0,behavior:'smooth'});
 }
@@ -64,6 +65,7 @@ async function load(){
   $('dataStamp').textContent=stamp+(stale.length?` · Check ${stale.join(', ')}`:'');
   $('dataStamp').classList.toggle('down',Boolean(missing.length||stale.length));
   renderOptions();updateTypeFields();renderOverview();renderTransactions();renderCash();renderDocs();renderReport();renderRecon();renderManage();
+  await loadJournal();
   if(state.page==='holdingDetail')renderDetail();
 }
 function renderOptions(){
@@ -207,6 +209,7 @@ function renderDetail(){
   <div class="two-col"><div class="card"><h2>Transactions</h2>${tx.length?tx.map(t=>`<div class="row"><div class="row-main"><b>${esc(t.type)} · ${esc(t.occurred_at)}</b><small>${esc(t.account_name)} · ${number(t.quantity)} shares</small></div><div class="row-side ${signClass(cashMovement(t))}">${money(cashMovement(t),t.currency)}</div></div>`).join(''):empty('No transactions.')}</div>
   <div class="card"><h2>Documents</h2>${docs.length?docs.map(d=>`<div class="row"><div class="row-main"><b>${esc(d.title)}</b><small>${esc(d.tax_year||d.original_name)}</small></div><a href="/api/documents/${d.id}/file" target="_blank" rel="noopener">Open</a></div>`).join(''):empty('No documents attached to this holding.')}</div></div>
   <div class="card"><h2>Recent price history</h2>${priceRows.length?priceRows.map(p=>`<div class="row"><span>${esc(p.day)} <small class="muted">${esc(p.source)}</small></span><b class="${signClass(p.close)}">${money(p.close,h.currency)}</b></div>`).join(''):empty('Add prices manually or connect a delayed price feed.')}</div>`;
+  const researchLink=document.createElement('button');researchLink.className='ghost';researchLink.textContent='Decisions & research →';researchLink.onclick=()=>{state.researchHolding=h.id;show('decisionHoldingDetail');renderResearch()};$('detailContent').prepend(researchLink);
   renderTradingViewOverview(h);
 }
 function renderTradingViewOverview(h){
@@ -307,11 +310,12 @@ async function deleteRecord(kind,id){
   await load();toast('Deleted');
 }
 function bind(){
+  bindJournal();
   $('loginForm').addEventListener('submit',e=>{e.preventDefault();(async()=>{try{const d=formData(e.target);state.auth=await api('/login','POST',d);$('loginError').textContent='';await enter()}catch(err){$('loginError').textContent=err.message}})()});
   $('logout').onclick=()=>action(async()=>{await api('/logout','POST');location.reload()});
   $('homeBrand').onclick=()=>show('overview');
   $('settingsButton').onclick=()=>show('settings');
-  $('portfolioSelect').onchange=()=>action(async()=>{state.pid=Number($('portfolioSelect').value);state.importToken=null;$('commitImport').hidden=true;$('importPreview').innerHTML='';Object.keys(state.editing).forEach(cancelEditor);show('overview');await load()});
+  $('portfolioSelect').onchange=()=>action(async()=>{state.pid=Number($('portfolioSelect').value);$('decisionEditor').hidden=true;state.journalEditing=null;state.importToken=null;$('commitImport').hidden=true;$('importPreview').innerHTML='';Object.keys(state.editing).forEach(cancelEditor);show('overview');await load()});
   document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>b.dataset.page==='admin'?showManage(state.manage):show(b.dataset.page));
   $('backToOverview').onclick=()=>show('overview');
   $('holdings').addEventListener('click',e=>{const row=e.target.closest('[data-holding]');if(row){state.selectedHolding=Number(row.dataset.holding);show('holdingDetail');renderDetail()}});

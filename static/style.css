@@ -8,3 +8,7 @@
 .year-select{width:auto;min-width:125px}.report-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}.report-scroll{overflow-x:auto}.report-table{width:100%;border-collapse:collapse;font-size:.84rem}.report-table th,.report-table td{padding:9px;text-align:left;border-bottom:1px solid #34445f;white-space:nowrap}.report-table td:last-child,.report-table th:last-child{text-align:right}@media(max-width:750px){.report-grid{grid-template-columns:1fr 1fr}}
 
 #ledgerWarning{border-color:#9c6666;color:#ffd0d1;background:#2b1c29}
+
+/* Decisions and research */
+.holding-link{font:inherit;color:var(--accent,#7eddd1);background:none;border:0;padding:0;text-decoration:underline;text-underline-offset:4px;cursor:pointer}
+.decision-event{border-left:3px solid #ab9aee}.decision-event h3,#decisionResearch h3{font-size:14px;margin:20px 0 8px}.decision-event p,#decisionResearch p{overflow-wrap:anywhere;line-height:1.6}.journal-chart{width:100%;height:auto;min-height:180px;display:block}.journal-chart text{fill:#94a3b8;font-size:12px}textarea{font:inherit;width:100%;resize:vertical;min-height:90px;background:#111827;color:#e5e7eb;border:1px solid #374151;border-radius:8px;padding:12px;box-sizing:border-box}#decisionForm>label,#researchForm>label{display:block;margin:16px 0}#decisionResearch table{width:100%;border-collapse:collapse;text-align:left}#decisionResearch td,#decisionResearch th{padding:12px;border-bottom:1px solid #374151}.table-scroll{overflow-x:auto}.decision-event summary{cursor:pointer;margin:16px 0}.decision-event .detail-grid{margin:18px 0}
